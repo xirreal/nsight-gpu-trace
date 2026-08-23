@@ -1,0 +1,41 @@
+[package]
+name = "nsight-gpu-trace"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Read and analyze NVIDIA Nsight Graphics GPU Trace captures"
+license = "MIT"
+repository = "https://github.com/xirreal/nsight-gpu-trace"
+keywords = ["gpu", "profiling", "nvidia", "vulkan", "opengl"]
+categories = ["development-tools::profiling", "parser-implementations"]
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/FORMAT.md",
+]
+
+[lib]
+name = "nsight_gpu_trace"
+
+[[bin]]
+name = "ngfx-trace"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+libloading = "0.9.0"
+lz4_flex = "0.14.0"
+memmap2 = "0.9.11"
+prost = "0.14.4"
+prost-reflect = { version = "0.16.5", features = ["serde"] }
+prost-types = "0.14.4"
+regex = "1.12.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tempfile = "3.26.0"
+thiserror = "2.0.18"

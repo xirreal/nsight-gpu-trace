@@ -1,0 +1,4 @@
+interface:
+  display_name: "Nsight Graphics Analyzer"
+  short_description: "Analyze NVIDIA GPU traces with Rust"
+  default_prompt: "Use $nsight-graphics-analyzer to inspect this completed GPU Trace capture and propose one measured optimization."

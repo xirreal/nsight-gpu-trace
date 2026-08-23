@@ -1,0 +1,34 @@
+nsight-gpu-trace
+================
+
+This is an independent project. It is not affiliated with, sponsored by, or
+endorsed by NVIDIA Corporation.
+
+The crate contains hand-written runtime compatibility declarations for the
+NVIDIA PerfWorks host API exposed by libnvperf_grfx_host.so on Linux and
+nvperf_grfx_host.dll on Windows. Their function names, parameter layouts,
+metric conventions, and behavior were derived from the public NVIDIA Nsight
+Perf SDK documentation and nvperf_host.h. NVIDIA SDK headers and binaries carry
+their own license terms and are not redistributed by this package. Users are
+responsible for obtaining a compatible Nsight Graphics/PerfWorks installation
+and complying with its license.
+
+The protobuf schema is not copied into this project. At runtime the crate
+recovers descriptors embedded in the user's installed WarpViz plugin binary.
+Metric formulas and counter data are likewise supplied only by the user's
+installed NVIDIA library and capture.
+
+Documentation consulted during design:
+
+- https://docs.nvidia.com/nsight-graphics/UserGuide/gpu-trace-overview.html
+- https://docs.nvidia.com/nsight-graphics/UserGuide/gpu-trace-ui.html
+- https://docs.nvidia.com/nsight-graphics/UserGuide/gpu-trace-system-architecture.html
+- https://docs.nvidia.com/nsight-graphics/UserGuide/shader-profiler.html
+- https://developer.nvidia.com/nsight-perf-sdk
+
+The CLI workflow also took inspiration from Luna5ama/Alpha-Piscium's
+nsight-graphics-analyzer skill. This crate decodes WRPV captures directly and
+does not include that project's code or exported data.
+
+NVIDIA, Nsight, PerfWorks, Vulkan, and OpenGL names belong to their respective
+owners.
