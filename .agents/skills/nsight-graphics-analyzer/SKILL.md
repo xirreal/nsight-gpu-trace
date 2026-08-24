@@ -2,7 +2,7 @@
 name: nsight-graphics-analyzer
 description: Analyze completed NVIDIA Nsight Graphics GPU Trace captures with the Rust ngfx-trace CLI or MCP server. Use for .ngfx-gputrace inspection, GPU bottleneck analysis, metric evaluation, scope attribution, or capture-driven optimization on Linux and Windows. Do not use for launching or controlling the captured application.
 metadata:
-  version: 0.1.0
+  version: 0.2.0
   short-description: Analyze Nsight traces with Rust MCP
 ---
 
@@ -22,17 +22,19 @@ searching broad default folders and guessing which file belongs to a run.
 
 ## Analyze a trace
 
-1. Call `open_capture`, then `capture_overview`. Confirm capture identity,
-   workload shape, timing precision, counter availability, and sample coverage.
-2. Use `top_down_report` for bounded triage. Use `list_metrics`, `scan_metrics`,
-   and `describe_metric` to discover exact collected metric names; never assume
-   a metric exists because it appeared in another capture.
-3. Resolve work with `list_scopes`, reuse its stable IDs, and call
-   `inspect_scope` before attributing a cost. Rank candidate scopes with
-   `rank_scopes`; query only the metrics needed to test the current hypothesis.
-4. Request a bounded series from `query_metrics` only when temporal behavior is
-   relevant. Use `trace_schema` followed by bounded `trace_query` for uncommon
-   captured fields.
+1. Call `analyze_capture` with the capture path. Confirm capture identity,
+   workload shape, timing precision, counter coverage, diagnostics, and the
+   automatic debug-group/NVTX/frame/timing-bucket region choice.
+2. Start from its findings and representative region metrics. Never assume a
+   metric exists because it appeared in another capture; add metric regexes or
+   exact names to the same one-shot call when the initial evidence suggests a
+   narrower hypothesis.
+3. For follow-up evidence, send one `query_capture` batch with the same capture
+   path. Resolve stable scope IDs, inspect calls/timings, describe metrics, and
+   evaluate the needed exact or regex-selected collected metrics together.
+4. Request bounded metric samples only when temporal behavior matters. Use
+   `trace_schema` and `trace_query` query types for uncommon captured fields,
+   and use stateless offsets for later pages.
 5. Correlate scope labels and captured strings with source using normal
    workspace search. Classify the result as an exact marker match,
    symbol/string evidence, or a hypothesis. Do not present a search candidate

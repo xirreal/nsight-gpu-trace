@@ -9,9 +9,8 @@ cargo install --path .
 codex mcp add nsight-gpu-trace -- ngfx-trace mcp
 ```
 
-Restart the MCP client after registration. Prefer a pathless long-lived server
-and use `open_capture` to replace the active trace. An optional trace argument
-can make one capture active at startup: `ngfx-trace mcp capture.ngfx-gputrace`.
+Restart the MCP client after registration. The long-lived server is stateless;
+every tool call supplies a capture path and owns its analysis for that call.
 
 ## Nsight libraries
 
@@ -31,18 +30,21 @@ For a nonstandard install or to pin the libraries that match a capture, set
 
 | Tool | Use |
 |---|---|
-| `open_capture` | Open or replace the active `.ngfx-gputrace` |
-| `capture_overview` | Check workload, frames, scopes, timing, artifacts, and counter metadata |
-| `list_metrics` | Discover PerfWorks metric bases by regex and kind |
-| `describe_metric` | Confirm an exact name, suffix, unit, and dependencies |
-| `scan_metrics` | Find which matching metric bases were collected |
-| `list_scopes` | Resolve bounded stable IDs for markers, frames, actions, and buckets |
-| `inspect_scope` | Read calls and timing evidence supporting one scope |
-| `query_metrics` | Evaluate exact names over one scope and optionally return a bounded series |
-| `rank_scopes` | Rank scopes with one metric evaluation; shared-bucket actions stay grouped |
-| `top_down_report` | Run compact heuristic triage over collected metrics |
-| `trace_schema`, `trace_query` | Discover and inspect uncommon dynamic protobuf fields |
+| `analyze_capture` | Run bounded one-shot identity, workload, timing, counter, complete metric-scan, diagnostic, fallback-region, and manifest analysis |
+| `query_capture` | Execute a bounded batch of typed follow-up queries against one freshly opened capture |
 
-Start with `open_capture` and `capture_overview`. Discover metric names from the
-capture, resolve named work to stable scope IDs, and request sample series only
-when temporal shape matters.
+`analyze_capture` accepts `capture`, optional `scope_pattern`, optional
+`metric_patterns` or exact `metrics`, and `top`. Regex metric selectors are
+matched against collected canonical metrics and evaluated in that call.
+
+`query_capture` accepts `capture` and one to 16 query objects. Available query
+types are `container_info`, `calls`, `timings`, `scopes`, `counter_samples`,
+`metric_discovery`, `metric_evaluation`, `trace_schema`, `trace_query`,
+`artifact_inventory`, and `artifact_read`. `metric_discovery` lists by regex or
+describes one exact metric; `metric_evaluation` accepts exact names, regexes, or
+both. Calls omit arguments and metric evaluations omit samples unless requested.
+Artifact reads are hex encoded and limited to 16 KiB per query. Use each query's
+offset for stateless paging.
+
+Use CLI `json`, `extract`, `section`, and `unpack` for complete protobuf or
+multi-megabyte binary output.

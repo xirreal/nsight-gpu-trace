@@ -122,12 +122,10 @@ codex mcp add nsight-gpu-trace -- ngfx-trace mcp
 ```
 
 This follows the [official Codex MCP configuration](https://developers.openai.com/codex/mcp/).
-Restart the client after registration. Use `open_capture` to load or replace the
-active capture; an optional startup path is also accepted:
-
-```sh
-ngfx-trace mcp capture.ngfx-gputrace
-```
+Restart the client after registration. The server is stateless: every tool call
+includes a capture path, opens that capture once, completes its analysis, and
+drops it before returning. Interleaved clients cannot replace one another's
+capture.
 
 For another MCP client:
 
@@ -142,17 +140,26 @@ For another MCP client:
 }
 ```
 
-The MCP tool surface is:
+The MCP advertises two tools:
 
-- `open_capture`, `capture_overview`
-- `list_metrics`, `describe_metric`, `scan_metrics`
-- `list_scopes`, `inspect_scope`, `query_metrics`, `rank_scopes`
-- `top_down_report`
-- `trace_schema`, `trace_query`
+- `analyze_capture` runs the complete one-shot pipeline. It accepts `capture`,
+  an optional `scope_pattern`, optional `metric_patterns` or exact `metrics`,
+  and a bounded `top`. The result includes capture/workload identity, timing and
+  counter coverage, a complete metric scan with top-down diagnostics,
+  representative capture and region summaries, automatic debug-group/NVTX/
+  frame/timing-bucket fallback, and a raw-data manifest.
+- `query_capture` executes up to 16 discriminated queries against one freshly
+  opened capture. Query types cover container sections, calls, timings, scopes,
+  counter samples, metric discovery/descriptions/evaluation, trace schema/data,
+  artifact inventory, and bounded artifact reads. Each paged query accepts its
+  own stateless offset.
 
-Start with `open_capture` and `capture_overview`. Discover metric names from the
-capture, resolve work to stable scope IDs, and request sample series only when
-temporal behavior matters.
+Default responses omit metric sample series, call arguments, and binary
+payloads. Regex metric selectors in `metric_evaluation` scan and evaluate the
+matching collected canonical metrics in the same call. Use CLI `json`,
+`extract`, `section`, and `unpack` for complete or multi-megabyte raw output.
+Modern MCP clients receive structured content only; legacy clients receive text
+JSON only.
 
 A generic analysis skill is included in
 [`.agents/skills/nsight-graphics-analyzer`](https://github.com/xirreal/nsight-gpu-trace/tree/main/.agents/skills/nsight-graphics-analyzer).
@@ -164,7 +171,7 @@ crates.io:
 
 ```toml
 [dependencies]
-nsight-gpu-trace = { git = "https://github.com/xirreal/nsight-gpu-trace", tag = "v0.1.0" }
+nsight-gpu-trace = { git = "https://github.com/xirreal/nsight-gpu-trace", tag = "v0.2.0" }
 ```
 
 ```rust

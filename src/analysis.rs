@@ -241,6 +241,22 @@ pub struct ScopedMetrics {
     pub samples: Vec<MetricSample>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopeMetricSummary {
+    pub scope: Scope,
+    pub summary: BTreeMap<String, MetricStatistics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopeMetricAggregation {
+    pub metrics: Vec<String>,
+    pub scope_count: usize,
+    pub evaluated_scope_count: usize,
+    pub sample_start: Option<usize>,
+    pub sample_stop: Option<usize>,
+    pub scopes: Vec<ScopeMetricSummary>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricStatistic {
@@ -979,6 +995,82 @@ impl Analysis {
         })
     }
 
+    /// Summarize several metrics for every scope with one PerfWorks evaluation
+    /// over the scopes' shared sample envelope.
+    pub fn aggregate_scope_metrics(
+        &mut self,
+        scopes: &[Scope],
+        metrics: &[String],
+    ) -> Result<ScopeMetricAggregation> {
+        if metrics.is_empty() {
+            return Ok(ScopeMetricAggregation {
+                metrics: Vec::new(),
+                scope_count: scopes.len(),
+                evaluated_scope_count: 0,
+                sample_start: None,
+                sample_stop: None,
+                scopes: scopes
+                    .iter()
+                    .cloned()
+                    .map(|scope| ScopeMetricSummary {
+                        scope,
+                        summary: BTreeMap::new(),
+                    })
+                    .collect(),
+            });
+        }
+
+        let mut resolved = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            match self.attach_samples(scope) {
+                Ok(scope) => resolved.push(scope),
+                Err(Error::TracePath(message)) => {
+                    let mut scope = scope.clone();
+                    scope
+                        .warnings
+                        .push(format!("Metric attribution unavailable: {message}"));
+                    resolved.push(scope);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let evaluated_scope_count = resolved
+            .iter()
+            .filter(|scope| metric_scope_bounds(scope).is_some())
+            .count();
+        let sample_start = resolved
+            .iter()
+            .filter_map(metric_scope_bounds)
+            .map(|(start, _)| start)
+            .min();
+        let sample_stop = resolved
+            .iter()
+            .filter_map(metric_scope_bounds)
+            .map(|(_, stop)| stop)
+            .max();
+        let rows = match sample_start.zip(sample_stop) {
+            Some((start, stop)) if start < stop => {
+                let envelope = self.scope_for_samples(
+                    start,
+                    stop,
+                    format!("samples:{start}..{stop}"),
+                    "multi-scope metric envelope",
+                )?;
+                self.evaluate_scope(&envelope, metrics)?.samples
+            }
+            _ => Vec::new(),
+        };
+
+        Ok(ScopeMetricAggregation {
+            metrics: metrics.to_vec(),
+            scope_count: scopes.len(),
+            evaluated_scope_count,
+            sample_start,
+            sample_stop,
+            scopes: aggregate_metric_rows(&resolved, metrics, &rows, sample_start),
+        })
+    }
+
     /// Rank scopes with one PerfWorks evaluation over their shared sample envelope.
     pub fn rank_scopes(
         &mut self,
@@ -1200,6 +1292,48 @@ impl Analysis {
         }
         Ok(*apis.first().unwrap())
     }
+}
+
+fn metric_scope_bounds(scope: &Scope) -> Option<(usize, usize)> {
+    scope
+        .sample_start
+        .zip(scope.sample_stop)
+        .filter(|(start, stop)| start < stop)
+        .filter(|_| scope.start_ns.zip(scope.end_ns).is_some())
+}
+
+fn aggregate_metric_rows(
+    scopes: &[Scope],
+    metrics: &[String],
+    rows: &[MetricSample],
+    envelope_start: Option<usize>,
+) -> Vec<ScopeMetricSummary> {
+    scopes
+        .iter()
+        .map(|scope| {
+            let selected = metric_scope_bounds(scope)
+                .zip(envelope_start)
+                .and_then(|((start, stop), envelope_start)| {
+                    let first = start.saturating_sub(envelope_start).min(rows.len());
+                    let stop = stop.saturating_sub(envelope_start).min(rows.len());
+                    (first < stop).then_some(&rows[first..stop])
+                })
+                .unwrap_or_default();
+            let (start_ns, end_ns) = scope.start_ns.zip(scope.end_ns).unwrap_or((0, 0));
+            ScopeMetricSummary {
+                scope: scope.clone(),
+                summary: metrics
+                    .iter()
+                    .map(|metric| {
+                        (
+                            metric.clone(),
+                            metric_statistics(selected, metric, start_ns, end_ns),
+                        )
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 pub fn metric_statistics(
@@ -1637,13 +1771,12 @@ fn marker_label(call: &ApiCall) -> Option<String> {
     let mut fallback = None;
     for argument in &call.arguments {
         let mut strings = Vec::new();
-        collect_strings(argument, &mut strings);
-        for (key, value) in strings {
+        collect_argument_strings(argument, &mut strings);
+        for (name, value) in strings {
             fallback.get_or_insert_with(|| value.clone());
-            if key.as_deref().is_some_and(|key| {
-                ["message", "label", "name", "pmarkername"]
-                    .contains(&key.to_ascii_lowercase().as_str())
-            }) {
+            if ["message", "label", "name", "pmarkername", "plabelname"]
+                .contains(&name.to_ascii_lowercase().as_str())
+            {
                 return Some(value);
             }
         }
@@ -1651,23 +1784,26 @@ fn marker_label(call: &ApiCall) -> Option<String> {
     fallback
 }
 
-fn collect_strings(value: &serde_json::Value, output: &mut Vec<(Option<String>, String)>) {
+fn collect_argument_strings(value: &serde_json::Value, output: &mut Vec<(String, String)>) {
     match value {
         serde_json::Value::Object(items) => {
-            for (key, value) in items {
-                if let Some(value) = value.as_str() {
-                    output.push((Some(key.clone()), value.to_owned()));
-                } else {
-                    collect_strings(value, output);
-                }
+            if let Some((name, value)) = items.get("name").and_then(serde_json::Value::as_str).zip(
+                items
+                    .get("stringValue")
+                    .and_then(|value| value.get("value"))
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                output.push((name.to_owned(), value.to_owned()));
+            }
+            for value in items.values() {
+                collect_argument_strings(value, output);
             }
         }
         serde_json::Value::Array(items) => {
             for value in items {
-                collect_strings(value, output);
+                collect_argument_strings(value, output);
             }
         }
-        serde_json::Value::String(value) => output.push((None, value.clone())),
         _ => {}
     }
 }
@@ -1808,6 +1944,45 @@ fn message_json(message: &DynamicMessage) -> Result<serde_json::Value> {
 mod tests {
     use super::*;
 
+    fn marker_call(arguments: Vec<serde_json::Value>) -> ApiCall {
+        ApiCall {
+            global_index: 0,
+            device_index: 0,
+            queue_index: 0,
+            stream_index: 0,
+            call_index: 0,
+            name: "marker".into(),
+            kind: CallKind::Marker,
+            interface: None,
+            arguments,
+            return_value: None,
+            metadata: None,
+        }
+    }
+
+    fn metric_scope(
+        id: &str,
+        start_ns: u64,
+        end_ns: u64,
+        sample_start: usize,
+        sample_stop: usize,
+        precision: &str,
+    ) -> Scope {
+        Scope {
+            kind: ScopeKind::DebugGroup,
+            id: id.into(),
+            label: id.into(),
+            start_ns: Some(start_ns),
+            end_ns: Some(end_ns),
+            call_start: None,
+            call_stop: None,
+            sample_start: Some(sample_start),
+            sample_stop: Some(sample_stop),
+            precision: precision.into(),
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn weighted_metric_statistics_use_overlap_duration() {
         let rows = vec![
@@ -1834,5 +2009,72 @@ mod tests {
         assert_eq!(statistics.mean, Some(20.0));
         assert_eq!(statistics.coverage_pct, 100.0);
         assert_eq!(statistics.p50, Some(20.0));
+    }
+
+    #[test]
+    fn marker_labels_use_string_values_instead_of_argument_metadata() {
+        let gl = marker_call(vec![
+            serde_json::json!({ "name": "source", "type": "UInt32" }),
+            serde_json::json!({
+                "name": "message",
+                "type": "String",
+                "stringValue": { "value": "composite19" },
+            }),
+        ]);
+        let vk = marker_call(vec![serde_json::json!({
+            "name": "pLabelInfo",
+            "type": "Structure",
+            "structureValue": {
+                "arguments": [{
+                    "name": "pLabelName",
+                    "type": "String",
+                    "stringValue": { "value": "BetterSDF composite" },
+                }],
+            },
+        })]);
+
+        assert_eq!(marker_label(&gl).as_deref(), Some("composite19"));
+        assert_eq!(marker_label(&vk).as_deref(), Some("BetterSDF composite"));
+    }
+
+    #[test]
+    fn multi_metric_aggregation_preserves_overlapping_scope_evidence_and_nulls() {
+        let rows = vec![
+            MetricSample {
+                range_index: 0,
+                timestamp_start_ns: 0,
+                timestamp_end_ns: 10,
+                time_ns: Some(0),
+                duration_ns: Some(10),
+                complete: true,
+                values: BTreeMap::from([("m".into(), Some(10.0)), ("null".into(), None)]),
+            },
+            MetricSample {
+                range_index: 1,
+                timestamp_start_ns: 10,
+                timestamp_end_ns: 20,
+                time_ns: Some(10),
+                duration_ns: Some(10),
+                complete: true,
+                values: BTreeMap::from([("m".into(), Some(30.0)), ("null".into(), None)]),
+            },
+        ];
+        let scopes = vec![
+            metric_scope("outer", 0, 20, 0, 2, "timestamp_bounded"),
+            metric_scope("nested", 0, 10, 0, 1, "timestamp_bounded"),
+            metric_scope("shared", 5, 15, 0, 2, "bucket_shared"),
+            metric_scope("streams", 0, 20, 0, 2, "multi_stream_envelope"),
+        ];
+        let summaries =
+            aggregate_metric_rows(&scopes, &["m".into(), "null".into()], &rows, Some(0));
+
+        assert_eq!(summaries.len(), 4);
+        assert_eq!(summaries[0].summary["m"].mean, Some(20.0));
+        assert_eq!(summaries[1].summary["m"].mean, Some(10.0));
+        assert_eq!(summaries[2].summary["m"].mean, Some(20.0));
+        assert_eq!(summaries[2].scope.precision, "bucket_shared");
+        assert_eq!(summaries[3].scope.precision, "multi_stream_envelope");
+        assert_eq!(summaries[0].summary["null"].mean, None);
+        assert_eq!(summaries[0].summary["null"].coverage_pct, 0.0);
     }
 }

@@ -40,11 +40,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Serve bounded analysis tools over MCP stdio. Open or replace captures at runtime.
-    Mcp {
-        /// Optional capture to make active before the client connects.
-        trace: Option<PathBuf>,
-    },
+    /// Serve stateless, bounded analysis tools over MCP stdio.
+    Mcp,
 
     /// Validate the WRPV container and list every section/chunk.
     Info { trace: PathBuf },
@@ -321,12 +318,8 @@ fn run() -> Result<()> {
         nvperf_library: cli.nvperf_library.clone(),
     };
     let output = match cli.command {
-        Command::Mcp { trace } => {
-            let server = match trace {
-                Some(trace) => McpServer::with_capture(options, trace)?,
-                None => McpServer::new(options),
-            };
-            server.serve()?;
+        Command::Mcp => {
+            McpServer::new(options).serve()?;
             return Ok(());
         }
         Command::Info { trace } => container_info(Container::open(trace)?),

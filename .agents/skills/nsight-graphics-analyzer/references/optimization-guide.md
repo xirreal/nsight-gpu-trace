@@ -36,9 +36,10 @@ separate capture after ordinary counters identify a shader-limited region.
    occupancy constraints.
 4. Inspect raster/geometry, overdraw, copies, and small actions only after the
    dominant axis is known.
-5. Localize the signal with `rank_scopes`, inspect the winning scope, and query
-   the exact metric there. Compare adjacent units to distinguish backpressure
-   from the unit that originated it.
+5. Localize the signal in `analyze_capture` regions, then batch `scopes`,
+   `timings`, and `metric_evaluation` queries for the winning stable scope ID.
+   Compare adjacent units to distinguish backpressure from the unit that
+   originated it.
 6. Form one falsifiable experiment and state the metric and timing change that
    would support or reject it.
 
@@ -60,9 +61,10 @@ These are operational starting points, not NVIDIA pass/fail specifications.
 | Small timed actions | `<5 us` each and numerous: batching/state-churn candidate, subject to timestamp precision |
 
 Ratios may be reported as `0..1` or percentages depending on the exact PerfWorks
-metric. Use `describe_metric` and preserve the returned units before applying a
-threshold. A cache with a low hit rate but negligible traffic is not the
-limiter; a saturated downstream unit may be backpressure rather than root cause.
+metric. Use an exact `metric_discovery` query and preserve the returned units
+before applying a threshold. A cache with a low hit rate but negligible traffic
+is not the limiter; a saturated downstream unit may be backpressure rather than
+root cause.
 
 ## Optimization branches
 

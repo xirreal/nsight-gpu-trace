@@ -22,8 +22,8 @@ pub mod trace;
 
 pub use analysis::{
     Analysis, AnalysisOptions, ApiCall, CallKind, DebugGroup, Frame, MetricStatistic,
-    MetricStatistics, NvtxRange, RankedScope, Scope, ScopeKind, ScopeRanking, ScopedMetrics,
-    TimestampBoundary, TimingBucket,
+    MetricStatistics, NvtxRange, RankedScope, Scope, ScopeKind, ScopeMetricAggregation,
+    ScopeMetricSummary, ScopeRanking, ScopedMetrics, TimestampBoundary, TimingBucket,
 };
 pub use container::{Chunk, Container, Section, SectionRole};
 pub use diagnostics::{

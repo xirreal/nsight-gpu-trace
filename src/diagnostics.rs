@@ -212,7 +212,7 @@ fn sort_by_mean_desc(metrics: &mut [MetricAvailability]) {
     });
 }
 
-fn metric_category(name: &str) -> &'static str {
+pub(crate) fn metric_category(name: &str) -> &'static str {
     let name = name.to_ascii_lowercase();
     if name.starts_with("sm__") || name.starts_with("smsp__") || name.starts_with("tpc__") {
         "shader"
