@@ -8,6 +8,10 @@ use serde::Serialize;
 
 use crate::{
     Error, Result, TraceDocument,
+    pc_sampling::{
+        PcSampling, TPC_ACTIVE_WARP_METRICS, TPC_CYCLES_METRIC, TpcCounterRange,
+        WarpWeightedSummary,
+    },
     perfworks::{
         CounterImage, CounterImageInfo, MetricBase, MetricCatalog, MetricDescriptor,
         MetricEvaluation, MetricSample, MetricScan, MetricsApi, PerfWorks, SampleInfo,
@@ -337,6 +341,9 @@ pub struct Analysis {
     debug_groups: Vec<DebugGroup>,
     nvtx_ranges: Vec<NvtxRange>,
     counters: Option<CounterState>,
+    pc_sampling: Option<PcSampling>,
+    /// Per-TPC counter ranges for the PC sampler warp weighting, with warnings.
+    tpc_counters: Option<(Vec<TpcCounterRange>, Vec<String>)>,
 }
 
 impl std::fmt::Debug for Analysis {
@@ -377,6 +384,8 @@ impl Analysis {
             debug_groups,
             nvtx_ranges,
             counters: None,
+            pc_sampling: None,
+            tpc_counters: None,
         })
     }
 
@@ -917,6 +926,78 @@ impl Analysis {
             ),
         );
         Ok(result)
+    }
+
+    /// Decode real-time shader profiler PC samples and the shader tables used
+    /// to attribute them. Captures without samples yield an empty result.
+    pub fn pc_sampling(&mut self) -> Result<&PcSampling> {
+        if self.pc_sampling.is_none() {
+            self.pc_sampling = Some(PcSampling::from_document(&self.document)?);
+        }
+        Ok(self.pc_sampling.as_ref().unwrap())
+    }
+
+    /// Nsight's `GPUTrace.PCSampler` warp metrics for a scope: PC samples
+    /// weighted by the active warps the periodic counters measured per TPC.
+    pub fn pc_sampling_warp_weighted(&mut self, scope: &Scope) -> Result<WarpWeightedSummary> {
+        if self.tpc_counters.is_none() {
+            let instances = self.pc_sampling()?.tpc_instances()?;
+            let api = self.metrics_api()?;
+            let counters = self.ensure_counters()?;
+            let ranges = 0..counters.info.periodic_sampler.populated_ranges;
+            let evaluate = |metric: &str| {
+                counters.perfworks.evaluate_instances(
+                    api,
+                    &counters.image,
+                    metric,
+                    instances,
+                    ranges.clone(),
+                )
+            };
+            let cycles = evaluate(TPC_CYCLES_METRIC)?;
+            let mut warps = vec![vec![0.0; instances]; cycles.len()];
+            let mut warnings = Vec::new();
+            for metric in TPC_ACTIVE_WARP_METRICS {
+                match evaluate(metric) {
+                    Ok(values) => {
+                        for (sum, row) in warps.iter_mut().zip(values) {
+                            for (sum, value) in sum.iter_mut().zip(row) {
+                                if value.is_finite() {
+                                    *sum += value;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if metric != TPC_ACTIVE_WARP_METRICS[2] => {
+                        warnings.push(format!(
+                            "{metric} is unavailable and counts as zero: {error}"
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let ranges = counters
+                .sample_info
+                .iter()
+                .zip(cycles.into_iter().zip(warps))
+                .map(|(info, (cycles, active_warps))| TpcCounterRange {
+                    range_index: info.range_index,
+                    start_ns: info.timestamp_start_ns,
+                    end_ns: info.timestamp_end_ns,
+                    cycles,
+                    active_warps,
+                })
+                .collect();
+            self.tpc_counters = Some((ranges, warnings));
+        }
+        let (ranges, warnings) = self.tpc_counters.as_ref().unwrap();
+        let mut summary = self
+            .pc_sampling
+            .as_ref()
+            .unwrap()
+            .warp_weighted(ranges, scope)?;
+        summary.warnings.extend(warnings.iter().cloned());
+        Ok(summary)
     }
 
     pub fn counter_info(&mut self) -> Result<&CounterImageInfo> {
@@ -1816,7 +1897,7 @@ fn histogram<T: Ord>(values: impl IntoIterator<Item = T>) -> BTreeMap<T, usize> 
     result
 }
 
-fn message_items<'a>(
+pub(crate) fn message_items<'a>(
     message: &'a DynamicMessage,
     name: &str,
 ) -> Result<impl Iterator<Item = &'a DynamicMessage>> {
@@ -1852,7 +1933,7 @@ fn message_items<'a>(
     }))
 }
 
-fn optional_message<'a>(
+pub(crate) fn optional_message<'a>(
     message: &'a DynamicMessage,
     name: &str,
 ) -> Result<Option<&'a DynamicMessage>> {
@@ -1886,10 +1967,31 @@ fn required_string(message: &DynamicMessage, name: &str) -> Result<String> {
     })
 }
 
-fn optional_string(message: &DynamicMessage, name: &str) -> Option<String> {
+pub(crate) fn optional_string(message: &DynamicMessage, name: &str) -> Option<String> {
     match field_value(message, name) {
         Some(Value::String(value)) => Some(value.clone()),
         _ => None,
+    }
+}
+
+pub(crate) fn optional_bytes<'a>(message: &'a DynamicMessage, name: &str) -> Option<&'a [u8]> {
+    match field_value(message, name) {
+        Some(Value::Bytes(value)) => Some(value.as_ref()),
+        _ => None,
+    }
+}
+
+pub(crate) fn u32_items(message: &DynamicMessage, name: &str) -> Vec<u32> {
+    match field_value(message, name) {
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::U32(value) => Some(*value),
+                Value::U64(value) => u32::try_from(*value).ok(),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1903,7 +2005,7 @@ fn required_u64(message: &DynamicMessage, name: &str) -> Result<u64> {
     })
 }
 
-fn optional_u64(message: &DynamicMessage, name: &str) -> Option<u64> {
+pub(crate) fn optional_u64(message: &DynamicMessage, name: &str) -> Option<u64> {
     match field_value(message, name) {
         Some(Value::U64(value)) => Some(*value),
         Some(Value::U32(value)) => Some(u64::from(*value)),
@@ -1913,7 +2015,7 @@ fn optional_u64(message: &DynamicMessage, name: &str) -> Option<u64> {
     }
 }
 
-fn enum_name(message: &DynamicMessage, name: &str) -> Result<Option<String>> {
+pub(crate) fn enum_name(message: &DynamicMessage, name: &str) -> Result<Option<String>> {
     let descriptor = message.descriptor();
     let field = descriptor.get_field_by_name(name).ok_or_else(|| {
         Error::Protobuf(format!("{} has no field {name}", descriptor.full_name()))
@@ -1936,7 +2038,7 @@ fn enum_name(message: &DynamicMessage, name: &str) -> Result<Option<String>> {
     ))
 }
 
-fn message_json(message: &DynamicMessage) -> Result<serde_json::Value> {
+pub(crate) fn message_json(message: &DynamicMessage) -> Result<serde_json::Value> {
     Ok(serde_json::to_value(message)?)
 }
 

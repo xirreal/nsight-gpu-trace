@@ -7,8 +7,8 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nsight_gpu_trace::{
-    Analysis, AnalysisOptions, ByteField, CallKind, Container, Error, McpServer, MetricKind,
-    QueryOptions, Result, ScopeKind, SectionRole, TraceDocument, top_down_report,
+    Analysis, AnalysisOptions, ByteField, CallKind, Container, Error, HotspotGrouping, McpServer,
+    MetricKind, QueryOptions, Result, ScopeKind, SectionRole, TraceDocument, top_down_report,
 };
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
@@ -127,6 +127,13 @@ enum Command {
         command: MetricsCommand,
     },
 
+    /// Decode and attribute real-time shader profiler PC samples.
+    #[command(name = "pc-samples")]
+    PcSamples {
+        #[command(subcommand)]
+        command: PcSamplesCommand,
+    },
+
     /// Build a compact, heuristic-labeled top-down report from every metric base.
     Report {
         trace: PathBuf,
@@ -220,6 +227,69 @@ enum MetricsCommand {
         #[command(flatten)]
         page: PageArgs,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PcSamplesCommand {
+    /// Totals, sample type (stall reason) distribution, and samples per shader.
+    Summary {
+        trace: PathBuf,
+        /// capture, a stable scope ID, calls:A..B, time:A..B, or relative-time:A..B.
+        #[arg(long, default_value = "capture")]
+        scope: String,
+        /// Also weight the samples by the active warps the counters measured per
+        /// TPC, as Nsight's GPUTrace.PCSampler export does (loads PerfWorks).
+        #[arg(long)]
+        warp_weighted: bool,
+    },
+
+    /// Shader modules and code blocks with debug info and whole-capture sample counts.
+    Shaders { trace: PathBuf },
+
+    /// Rank source lines, SPIR-V instructions, or SASS instructions by sample count.
+    Hotspots {
+        trace: PathBuf,
+        /// capture, a stable scope ID, calls:A..B, time:A..B, or relative-time:A..B.
+        #[arg(long, default_value = "capture")]
+        scope: String,
+        #[arg(long, value_enum, default_value = "line")]
+        group_by: CliHotspotGrouping,
+        /// Case-insensitive regular expression matched against shader name or hash.
+        #[arg(long)]
+        shader: Option<String>,
+        #[command(flatten)]
+        page: PageArgs,
+    },
+
+    /// Decode individual sample records with their attribution.
+    Records {
+        trace: PathBuf,
+        /// capture, a stable scope ID, calls:A..B, time:A..B, or relative-time:A..B.
+        #[arg(long, default_value = "capture")]
+        scope: String,
+        /// Only samples of this virtual SM.
+        #[arg(long)]
+        sm: Option<u32>,
+        #[command(flatten)]
+        page: PageArgs,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliHotspotGrouping {
+    Line,
+    Instruction,
+    Sass,
+}
+
+impl From<CliHotspotGrouping> for HotspotGrouping {
+    fn from(value: CliHotspotGrouping) -> Self {
+        match value {
+            CliHotspotGrouping::Line => Self::Line,
+            CliHotspotGrouping::Instruction => Self::Instruction,
+            CliHotspotGrouping::Sass => Self::Sass,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -443,6 +513,7 @@ fn run() -> Result<()> {
             })
         }
         Command::Metrics { command } => metrics_command(command, options)?,
+        Command::PcSamples { command } => pc_samples_command(command, options)?,
         Command::Report { trace, top } => {
             let mut analysis = Analysis::open(trace, options)?;
             let overview = analysis.overview();
@@ -618,6 +689,80 @@ fn metrics_command(command: MetricsCommand, options: AnalysisOptions) -> Result<
                 "unavailable_metric_bases": selected.len() - available,
                 "metrics": page_value(&metrics, &page)?,
                 "null_semantics": "Unavailable/not collected is omitted by default; use --include-unavailable to show it.",
+            }))
+        }
+    }
+}
+
+fn pc_samples_command(command: PcSamplesCommand, options: AnalysisOptions) -> Result<Value> {
+    match command {
+        PcSamplesCommand::Summary {
+            trace,
+            scope,
+            warp_weighted,
+        } => {
+            let mut analysis = Analysis::open(trace, options)?;
+            let scope = analysis.parse_scope(&scope)?;
+            let mut summary = serde_json::to_value(analysis.pc_sampling()?.summary(&scope)?)?;
+            if warp_weighted {
+                summary["warp_weighted"] = match analysis.pc_sampling_warp_weighted(&scope) {
+                    Ok(weighted) => serde_json::to_value(weighted)?,
+                    Err(error) => json!({ "error": error.to_string() }),
+                };
+            }
+            Ok(summary)
+        }
+        PcSamplesCommand::Shaders { trace } => {
+            let mut analysis = Analysis::open(trace, options)?;
+            Ok(analysis.pc_sampling()?.shaders())
+        }
+        PcSamplesCommand::Hotspots {
+            trace,
+            scope,
+            group_by,
+            shader,
+            page,
+        } => {
+            let mut analysis = Analysis::open(trace, options)?;
+            let scope = analysis.parse_scope(&scope)?;
+            let shader = compile_filter(shader.as_deref())?;
+            let report =
+                analysis
+                    .pc_sampling()?
+                    .hotspots(&scope, group_by.into(), shader.as_ref())?;
+            Ok(json!({
+                "group_by": report.group_by,
+                "scope": report.scope,
+                "selected_samples": report.selected_samples,
+                "matching_samples": report.matching_samples,
+                "share_basis": report.share_basis,
+                "hotspots": page_value(&report.hotspots, &page)?,
+                "warnings": report.warnings,
+            }))
+        }
+        PcSamplesCommand::Records {
+            trace,
+            scope,
+            sm,
+            page,
+        } => {
+            let mut analysis = Analysis::open(trace, options)?;
+            let scope = analysis.parse_scope(&scope)?;
+            let (records, total, scope) =
+                analysis
+                    .pc_sampling()?
+                    .records(&scope, sm, page.offset, page.limit)?;
+            let offset = page.offset.min(total);
+            Ok(json!({
+                "scope": scope,
+                "time_attribution": nsight_gpu_trace::pc_sampling::TIME_ATTRIBUTION,
+                "items": records,
+                "page": {
+                    "offset": offset,
+                    "returned": records.len(),
+                    "total": total,
+                    "next_offset": (offset + records.len() < total).then_some(offset + records.len()),
+                },
             }))
         }
     }

@@ -91,6 +91,35 @@ For many small actions, first verify that timing is action-precise. Then test
 batching, indirect/multi-draw submission, state sorting, or moving repeated CPU
 work to GPU-driven structures. Preserve ordering and synchronization semantics.
 
+## Shader-level evidence (PC samples)
+
+Real-Time Shader Profiler captures sample warps at a fixed cycle interval
+(`pcSamplingInterval`). Each sample records a warp's PC and why it did or did
+not issue.
+
+1. Choose the region first, then query `pc_sampling` with its scope. Every
+   active SM is sampled at the same rate, however many warps it holds.
+   Raw sample shares therefore over-represent low-occupancy shaders, and
+   `warp_weighted` corrects for the warps each TPC actually held.
+2. Rank shaders and stall reasons by their `warp_weighted` values. Then rank the
+   leading shader's source lines with `hotspots`; each row names its pipeline,
+   sample types, instruction mix, and SASS instruction count.
+3. Read the leading sample types as hypotheses:
+
+| Sample type | Usual meaning |
+|---|---|
+| `long_scoreboard_pipe_l1tex` | waiting for global, local, texture, or surface results |
+| `short_scoreboard`, `mio_throttle_pipe_mio` | waiting for, or queued behind, shared memory and other MIO operations |
+| `lg_throttle`, `tex_throttle` | local/global or texture instruction queues full |
+| `barrier`, `membar` | waiting at a CTA or memory barrier |
+| `wait` | fixed-latency dependency between nearby instructions |
+| `math_pipe_throttle`, `dispatch_stall` | a busy execution pipe or dispatcher |
+| `branch_resolving`, `no_instruction`, `imc_miss` | branch resolution, instruction fetch, or immediate-constant cache misses |
+| `selected`, `not_selected` | issued, or eligible while another warp issued; a large share means latency is hidden |
+
+4. Confirm a line-level hypothesis with `group_by: "instruction"` or `"sass"`
+   and the line's instruction mix before changing source.
+
 ## Reporting contract
 
 An actionable finding contains:

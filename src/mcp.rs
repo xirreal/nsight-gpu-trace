@@ -11,14 +11,15 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    Analysis, AnalysisOptions, ApiCall, CallKind, Container, MetricKind, MetricScan,
-    MetricStatistics, QueryOptions, Result, Scope, ScopeKind, ScopeMetricSummary, TimingBucket,
-    TopDownReport, diagnostics::metric_category, top_down_report,
+    Analysis, AnalysisOptions, ApiCall, CallKind, Container, HotspotGrouping, MetricKind,
+    MetricScan, MetricStatistics, QueryOptions, Result, Scope, ScopeKind, ScopeMetricSummary,
+    TimingBucket, TopDownReport, diagnostics::metric_category, pc_sampling::WarpWeightedCount,
+    top_down_report,
 };
 
 const PROTOCOL_VERSIONS: &[&str] = &["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
 const FALLBACK_PROTOCOL: &str = "2025-06-18";
-const INSTRUCTIONS: &str = "Pass a .ngfx-gputrace path to every tool call. Use analyze_capture for one-shot triage and query_capture for bounded follow-up queries. Null means unavailable, never zero. bucket_shared evidence belongs to the whole timing bucket. Treat thresholds as hypotheses and validate changes with a same-settings recapture.";
+const INSTRUCTIONS: &str = "Pass a .ngfx-gputrace path to every tool call. Use analyze_capture for one-shot triage and query_capture for bounded follow-up queries. Null means unavailable, never zero. bucket_shared evidence belongs to the whole timing bucket. PC sample shares are percent of the samples selected by the scope; a time scope selects every sample whose assigned counter range overlaps it, and line hotspots count each pipeline separately, as the Nsight UI does. warp_weighted values reproduce Nsight's GPUTrace.PCSampler export (average warps and percent of SM warp slots). Treat thresholds as hypotheses and validate changes with a same-settings recapture.";
 const DEFAULT_TOP: usize = 8;
 const MAX_TOP: usize = 25;
 const MAX_QUERIES: usize = 16;
@@ -359,6 +360,7 @@ fn analyze_capture(
             )
         })
         .collect::<Vec<_>>();
+    let pc_sampling = pc_sampling_section(analysis, top, &mut unavailable_evidence);
     let container = analysis.document().container();
     let timing = timing_summary(analysis, &regions.precision);
     let workload = workload_summary(analysis);
@@ -421,6 +423,7 @@ fn analyze_capture(
             "selection": metric_selection,
             "capture_summary": capture_metric_summary,
         },
+        "pc_sampling": pc_sampling,
         "regions": {
             "kind": regions.kind,
             "scope_pattern": scope_pattern.map(Regex::as_str),
@@ -464,6 +467,7 @@ fn analyze_capture(
                 "call arguments and return values",
                 "artifact payloads",
                 "complete raw protobuf values",
+                "individual PC sample records and SPIR-V/SASS hotspots",
             ],
             "follow_up": {
                 "tool": "query_capture",
@@ -473,6 +477,131 @@ fn analyze_capture(
     });
     bound_analyze_result(&mut result);
     Ok(result)
+}
+
+/// Compact whole-capture PC sampling view: sample types, shaders, and hot lines.
+fn pc_sampling_section(
+    analysis: &mut Analysis,
+    top: usize,
+    unavailable_evidence: &mut Vec<String>,
+) -> Value {
+    let scope = analysis.capture_scope();
+    let sampling = match analysis.pc_sampling() {
+        Ok(sampling) => sampling,
+        Err(error) => {
+            unavailable_evidence.push(format!("PC sampling evidence unavailable: {error}"));
+            return json!({ "available": false, "error": error.to_string() });
+        }
+    };
+    if sampling.is_empty() {
+        unavailable_evidence.push("real-time shader profiler PC samples are absent".into());
+        return json!({
+            "available": false,
+            "unavailable_reason": sampling.unavailable_reason(),
+            "shader_modules": sampling.profile().modules.len(),
+            "code_blocks": sampling.profile().code_blocks.len(),
+        });
+    }
+    let (summary, hotspots) = match sampling.summary(&scope).and_then(|summary| {
+        sampling
+            .hotspots(&scope, HotspotGrouping::Line, None)
+            .map(|hotspots| (summary, hotspots))
+    }) {
+        Ok(result) => result,
+        Err(error) => return json!({ "available": false, "error": error.to_string() }),
+    };
+    let sample_types = summary
+        .sample_types
+        .iter()
+        .take(top)
+        .map(|entry| json!({ "name": entry.name, "samples": entry.samples, "share_pct": entry.share_pct }))
+        .collect::<Vec<_>>();
+    let instruction_mix = summary
+        .instruction_mix
+        .iter()
+        .take(top)
+        .map(|entry| json!({ "class": entry.label, "samples": entry.samples, "share_pct": entry.share_pct }))
+        .collect::<Vec<_>>();
+    let shaders = summary
+        .shaders
+        .iter()
+        .take(top)
+        .map(|shader| {
+            json!({
+                "shader": shader.shader,
+                "hash": shader.hash,
+                "samples": shader.samples,
+                "share_pct": shader.share_pct,
+                "leading_sample_type": shader.sample_types.first().map(|entry| &entry.name),
+                "leading_instruction_class": shader.instruction_mix.first().map(|entry| &entry.label),
+            })
+        })
+        .collect::<Vec<_>>();
+    let hotspot_lines = hotspots
+        .hotspots
+        .iter()
+        .take(top)
+        .map(|hotspot| {
+            json!({
+                "shader": hotspot.shader,
+                "pipeline": hotspot.pipeline,
+                "file": hotspot.file,
+                "line": hotspot.line,
+                "samples": hotspot.samples,
+                "share_pct": hotspot.share_pct,
+                "sass_instructions": hotspot.sass_instructions,
+                "leading_sample_types": hotspot.sample_types.iter().take(3).map(|entry| &entry.name).collect::<Vec<_>>(),
+                "leading_instruction_classes": hotspot.instruction_mix.iter().take(3).map(|entry| &entry.label).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let warp_weighted = match analysis.pc_sampling_warp_weighted(&scope) {
+        Ok(weighted) => {
+            let rows = |entries: &[WarpWeightedCount]| {
+                entries
+                    .iter()
+                    .take(top)
+                    .map(|entry| {
+                        json!({
+                            "name": entry.name,
+                            "hash": entry.hash,
+                            "avg_warps": entry.avg_warps,
+                            "pct_of_peak": entry.pct_of_peak,
+                            "share_pct": entry.share_pct,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            json!({
+                "basis": weighted.basis,
+                "peak_warps_per_sm": weighted.peak_warps_per_sm,
+                "attributed_avg_warps": weighted.attributed_avg_warps,
+                "unattributed_avg_warps": weighted.unattributed_avg_warps,
+                "sample_types": rows(&weighted.sample_types),
+                "shaders": rows(&weighted.shaders),
+            })
+        }
+        Err(error) => json!({ "available": false, "error": error.to_string() }),
+    };
+    json!({
+        "available": true,
+        "records": summary.records,
+        "sm_streams": summary.sm_streams,
+        "gpus": summary.gpus,
+        "attribution": summary.attribution,
+        "sample_types": sample_types,
+        "instruction_mix": instruction_mix,
+        "shaders": shaders,
+        "warp_weighted": warp_weighted,
+        "hotspot_lines": hotspot_lines,
+        "share_basis": hotspots.share_basis,
+        "time_attribution": summary.time_attribution,
+        "warnings": summary.warnings.iter().take(5).collect::<Vec<_>>(),
+        "follow_up": {
+            "query_type": "pc_sampling",
+            "views": ["summary", "shaders", "hotspots", "records"],
+        },
+    })
 }
 
 fn select_regions(
@@ -908,6 +1037,14 @@ fn bound_analyze_result(result: &mut Value) {
         }
     }
     while serialized_len(result) > MAX_ANALYZE_RESULT_BYTES {
+        let Some(items) = result["pc_sampling"]["hotspot_lines"].as_array_mut() else {
+            break;
+        };
+        if items.pop().is_none() {
+            break;
+        }
+    }
+    while serialized_len(result) > MAX_ANALYZE_RESULT_BYTES {
         let Some(items) = result["manifest"]["protobuf"]["root_fields"]["items"].as_array_mut()
         else {
             break;
@@ -934,6 +1071,7 @@ const QUERY_TYPES: &[&str] = &[
     "trace_query",
     "artifact_inventory",
     "artifact_read",
+    "pc_sampling",
 ];
 
 fn execute_query(
@@ -953,6 +1091,7 @@ fn execute_query(
         "trace_query" => trace_query(analysis, query),
         "artifact_inventory" => artifact_inventory_query(analysis, query),
         "artifact_read" => artifact_read_query(analysis, query),
+        "pc_sampling" => pc_sampling_query(analysis, query),
         _ => Err(format!("unsupported query type {kind:?}")),
     }
 }
@@ -1344,6 +1483,86 @@ fn artifact_read_query(
     }))
 }
 
+fn pc_sampling_query(
+    analysis: &mut Analysis,
+    query: &Map<String, Value>,
+) -> std::result::Result<Value, String> {
+    let view = string(query, "view").unwrap_or("summary");
+    let offset = integer(query, "offset", 0)?;
+    let limit = integer(query, "limit", 50)?.clamp(1, MAX_PAGE);
+    let scope_name = string(query, "scope").unwrap_or("capture");
+    let scope = match view {
+        "shaders" => analysis.capture_scope(),
+        _ => analysis
+            .parse_scope(scope_name)
+            .map_err(|error| error.to_string())?,
+    };
+    let sampling = analysis.pc_sampling().map_err(|error| error.to_string())?;
+    match view {
+        "summary" => {
+            let summary = sampling
+                .summary(&scope)
+                .map_err(|error| error.to_string())?;
+            let mut value = serde_json::to_value(&summary).map_err(|error| error.to_string())?;
+            value["shaders"] = paged(&summary.shaders, offset, limit)?;
+            if query.get("warp_weighted").and_then(Value::as_bool) == Some(true) {
+                value["warp_weighted"] = match analysis.pc_sampling_warp_weighted(&scope) {
+                    Ok(weighted) => {
+                        serde_json::to_value(weighted).map_err(|error| error.to_string())?
+                    }
+                    Err(error) => json!({ "available": false, "error": error.to_string() }),
+                };
+            }
+            Ok(value)
+        }
+        "shaders" => {
+            let mut value = sampling.shaders();
+            for field in ["modules", "code_blocks"] {
+                let items = value[field].as_array().cloned().unwrap_or_default();
+                value[field] = paged(&items, offset, limit)?;
+            }
+            Ok(value)
+        }
+        "hotspots" => {
+            let group_by = match string(query, "group_by").unwrap_or("line") {
+                "line" => HotspotGrouping::Line,
+                "instruction" => HotspotGrouping::Instruction,
+                "sass" => HotspotGrouping::Sass,
+                other => return Err(format!("unsupported group_by {other:?}")),
+            };
+            let shader = regex(query, "shader_pattern")?;
+            let report = sampling
+                .hotspots(&scope, group_by, shader.as_ref())
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "group_by": report.group_by,
+                "scope": report.scope,
+                "selected_samples": report.selected_samples,
+                "matching_samples": report.matching_samples,
+                "share_basis": report.share_basis,
+                "hotspots": paged(&report.hotspots, offset, limit)?,
+                "warnings": report.warnings,
+            }))
+        }
+        "records" => {
+            let vsmid = optional_integer(query, "vsmid")?
+                .map(|value| u32::try_from(value).map_err(|_| "vsmid is out of range".to_owned()))
+                .transpose()?;
+            let (records, total, scope) = sampling
+                .records(&scope, vsmid, offset, limit)
+                .map_err(|error| error.to_string())?;
+            let start = offset.min(total);
+            Ok(json!({
+                "scope": scope,
+                "time_attribution": crate::pc_sampling::TIME_ATTRIBUTION,
+                "items": records,
+                "page": page(start, start + records.len(), total),
+            }))
+        }
+        other => Err(format!("unsupported pc_sampling view {other:?}")),
+    }
+}
+
 fn server_info() -> Value {
     json!({ "name": "nsight-gpu-trace", "version": env!("CARGO_PKG_VERSION") })
 }
@@ -1359,7 +1578,7 @@ fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "query_capture",
-            "Open one capture for this call and execute a bounded batch of typed container, trace, call, timing, scope, counter, metric, or artifact queries.",
+            "Open one capture for this call and execute a bounded batch of typed container, trace, call, timing, scope, counter, metric, artifact, or PC sampling queries.",
             query_capture_schema(),
             annotations,
         ),
@@ -1512,6 +1731,25 @@ fn query_schemas() -> Vec<Value> {
                 "limit": { "type": "integer", "minimum": 1, "maximum": MAX_ARTIFACT_READ, "default": 4096 }
             },
             "required": ["type", "path"], "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "type": { "const": "pc_sampling" },
+                "view": {
+                    "type": "string",
+                    "enum": ["summary", "shaders", "hotspots", "records"],
+                    "default": "summary",
+                    "description": "summary: sample types and shaders; shaders: modules, code blocks, debug info; hotspots: ranked source lines per pipeline, SPIR-V or SASS instructions, with SASS instruction counts; records: decoded samples."
+                },
+                "scope": { "type": "string", "default": "capture", "description": "capture, a scope ID, calls:A..B, time:A..B, or relative-time:A..B." },
+                "group_by": { "type": "string", "enum": ["line", "instruction", "sass"], "default": "line" },
+                "shader_pattern": { "type": "string", "description": "Case-insensitive regex matched against shader name or hash (hotspots)." },
+                "warp_weighted": { "type": "boolean", "default": false, "description": "summary: also weight samples by the active warps counted per TPC, reproducing Nsight's GPUTrace.PCSampler export (stall reasons and shaders as avg warps / % of warp slots)." },
+                "vsmid": { "type": "integer", "minimum": 0, "description": "Only samples of this virtual SM (records)." },
+                "offset": page_offset_schema(), "limit": page_limit_schema()
+            },
+            "required": ["type"], "additionalProperties": false
         }),
     ]
 }

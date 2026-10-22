@@ -35,11 +35,17 @@ searching broad default folders and guessing which file belongs to a run.
 4. Request bounded metric samples only when temporal behavior matters. Use
    `trace_schema` and `trace_query` query types for uncommon captured fields,
    and use stateless offsets for later pages.
-5. Correlate scope labels and captured strings with source using normal
+5. When `analyze_capture` reports `pc_sampling.available`, the capture holds
+   Real-Time Shader Profiler samples. Query `pc_sampling` with the region's
+   scope; a frame scope reproduces the Nsight UI. Rank shaders and stall
+   reasons with `summary` and `warp_weighted: true`, source lines per pipeline
+   with `hotspots`, then one hot line with `group_by: "instruction"` or
+   `"sass"`.
+6. Correlate scope labels and captured strings with source using normal
    workspace search. Classify the result as an exact marker match,
    symbol/string evidence, or a hypothesis. Do not present a search candidate
    as proof.
-6. Turn the finding into one experiment with an expected timing or metric
+7. Turn the finding into one experiment with an expected timing or metric
    movement, then compare a same-settings recapture.
 
 ## Evidence rules
@@ -52,6 +58,13 @@ searching broad default folders and guessing which file belongs to a run.
   duration. An unclosed marker or unvalidated NVTX clock weakens attribution.
 - A high percent-of-peak value identifies pressure, not causality. Compare
   neighboring units and timing before naming a limiter.
+- PC sample shares are percent of the samples in the scope. `warp_weighted`
+  values are average warps per SM and cycle, as in Nsight's GPU Trace export.
+  Compare shaders and stall reasons with the weighted values, because raw
+  shares over-represent low-occupancy shaders. Compare hotspot lines with the
+  raw shares, as the Nsight source view does.
+- PC samples are statistical. A line with only a few hundred samples is weak
+  evidence.
 - Treat thresholds in the optimization guide as heuristics and verify them with
   a controlled change.
 

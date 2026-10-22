@@ -592,6 +592,90 @@ impl PerfWorks {
         })
     }
 
+    /// Evaluate one metric per hardware unit instance (for example per TPC)
+    /// for every counter sample in `ranges`. Unavailable values are NaN.
+    pub fn evaluate_instances(
+        &self,
+        api: MetricsApi,
+        image: &CounterImage,
+        metric_name: &str,
+        instance_count: usize,
+        ranges: std::ops::Range<usize>,
+    ) -> Result<Vec<Vec<f64>>> {
+        let info = self.inspect(image)?;
+        let evaluator = self.evaluator(api, &info.chip_name)?;
+        let c_name = CString::new(metric_name)
+            .map_err(|_| Error::PerfWorks(format!("metric name contains NUL: {metric_name:?}")))?;
+        let request = evaluator.convert_metric(metric_name, &c_name)?;
+        let hardware_unit = evaluator.describe(metric_name)?.hardware_unit_id;
+        evaluator.set_device_attributes(image)?;
+        let function = self.internal_function(c"NVPW_MetricsEvaluator_EvaluateToInstanceValues")?;
+        let last = ranges.end.min(info.periodic_sampler.populated_ranges);
+        let mut series = Vec::with_capacity(last.saturating_sub(ranges.start));
+        for range_index in ranges.start..last {
+            let mut values = vec![f64::NAN; instance_count];
+            let mut params = NvEvaluateInstances {
+                struct_size: size_of::<NvEvaluateInstances>(),
+                p_priv: ptr::null_mut(),
+                evaluator: evaluator.pointer,
+                request: &request,
+                request_size: metric_request_size(),
+                counter_data: image.pointer(),
+                counter_data_size: image.len(),
+                range_index,
+                isolated: 0,
+                hardware_unit,
+                instance_count,
+                values: values.as_mut_ptr(),
+            };
+            // SAFETY: the layout mirrors the call in Nsight's WarpViz plugin,
+            // and `values` holds `instance_count` doubles.
+            let status = unsafe { function(ptr::from_mut(&mut params).cast()) };
+            if status != 0 {
+                return Err(status_error(
+                    b"NVPW_MetricsEvaluator_EvaluateToInstanceValues\0",
+                    status,
+                ));
+            }
+            // WarpViz treats a different instance count as a failure, too.
+            if params.instance_count != instance_count {
+                return Err(Error::PerfWorks(format!(
+                    "{metric_name} has {} instances, expected {instance_count}",
+                    params.instance_count
+                )));
+            }
+            series.push(values);
+        }
+        Ok(series)
+    }
+
+    /// Resolve a host function that is not exported by name. Nsight's plugins
+    /// obtain a resolver from `NVPA_GetProcAddress("1111")` and look names up
+    /// through it.
+    fn internal_function(&self, name: &CStr) -> Result<unsafe extern "C" fn(*mut c_void) -> i32> {
+        type Resolver = unsafe extern "C" fn(*const c_char) -> *const c_void;
+        type GetProcAddress = unsafe extern "C" fn(*const c_char) -> Option<Resolver>;
+        // SAFETY: NVPA_GetProcAddress takes a key string and returns a name
+        // resolver; both are called immediately while self.library is loaded.
+        unsafe {
+            let get: Symbol<'_, GetProcAddress> = self.library.get(b"NVPA_GetProcAddress\0")?;
+            let resolver = get(c"1111".as_ptr()).ok_or_else(|| {
+                Error::PerfWorks("NVPA_GetProcAddress returned no resolver".into())
+            })?;
+            let function = resolver(name.as_ptr());
+            if function.is_null() {
+                return Err(Error::PerfWorks(format!(
+                    "{} is not available in this PerfWorks host",
+                    name.to_string_lossy()
+                )));
+            }
+            Ok(std::mem::transmute::<
+                *const c_void,
+                unsafe extern "C" fn(*mut c_void) -> i32,
+            >(function))
+        }
+    }
+
     /// Evaluate one canonical form of each metric base in a single pass.
     /// Finite zeroes count as collected values; unavailable values do not.
     pub fn scan(
@@ -1457,6 +1541,24 @@ struct NvEvaluateMetrics {
     counter_data_size: usize,
     range_index: usize,
     isolated: u8,
+    values: *mut f64,
+}
+
+/// Layout used by Nsight's WarpViz plugin (2026.3.1) for the internal
+/// `NVPW_MetricsEvaluator_EvaluateToInstanceValues`.
+#[repr(C)]
+struct NvEvaluateInstances {
+    struct_size: usize,
+    p_priv: *mut c_void,
+    evaluator: *mut c_void,
+    request: *const NvMetricRequest,
+    request_size: usize,
+    counter_data: *const u8,
+    counter_data_size: usize,
+    range_index: usize,
+    isolated: u8,
+    hardware_unit: u64,
+    instance_count: usize,
     values: *mut f64,
 }
 
