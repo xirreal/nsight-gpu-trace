@@ -4,7 +4,7 @@ use std::{
 };
 
 use prost_reflect::{DynamicMessage, Kind, ReflectMessage, Value};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Error, Result, TraceDocument,
@@ -67,6 +67,18 @@ impl CallKind {
     pub fn is_action(self) -> bool {
         self != Self::Marker
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InfoEntry {
+    pub name: Option<String>,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InfoTable {
+    pub name: Option<String>,
+    pub entries: Vec<InfoEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +146,7 @@ impl TimingBucket {
             .iter()
             .find(|stage| stage.stage == "PB_PIPELINE_STAGE_BOTTOM_OF_PIPE")
             .or_else(|| self.stages.first())
+            .filter(|stage| stage.start_ptimer > 0 && stage.end_ptimer > stage.start_ptimer)
             .map(|stage| (stage.start_ptimer, stage.end_ptimer))
     }
 }
@@ -181,7 +194,7 @@ pub struct NvtxRange {
     pub end_thread_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeKind {
     Capture,
@@ -195,7 +208,7 @@ pub enum ScopeKind {
     TimingBucket,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scope {
     pub kind: ScopeKind,
     pub id: String,
@@ -224,12 +237,15 @@ pub struct MetricStatistics {
     pub selected_samples: usize,
     pub coverage_pct: f64,
     pub mean: Option<f64>,
+    pub stddev: Option<f64>,
     pub min: Option<f64>,
     pub min_range_index: Option<usize>,
     pub max: Option<f64>,
     pub max_range_index: Option<usize>,
+    /// Duration-weighted percentile, using each sample's overlap with the scope.
     pub p50: Option<f64>,
     pub p95: Option<f64>,
+    /// Arithmetic sum of the selected sample values. It is not time weighted.
     pub sum: Option<f64>,
 }
 
@@ -333,6 +349,8 @@ pub struct Analysis {
     calls: Vec<ApiCall>,
     timestamps: Vec<TimestampBoundary>,
     timing_buckets: Vec<TimingBucket>,
+    /// Global call index to the timing bucket that owns it, when timestamped.
+    bucket_for_call: Vec<Option<usize>>,
     frames: Vec<Frame>,
     debug_groups: Vec<DebugGroup>,
     nvtx_ranges: Vec<NvtxRange>,
@@ -366,6 +384,16 @@ impl Analysis {
         let frames = index_frames(document.message())?;
         let debug_groups = index_debug_groups(&calls);
         let nvtx_ranges = index_nvtx(document.message())?;
+        let mut bucket_for_call = vec![None; calls.len()];
+        for bucket in &timing_buckets {
+            if bucket.interval().is_none() {
+                continue;
+            }
+            let stop = bucket.next_global_call_index.min(calls.len());
+            if bucket.first_global_call_index < stop {
+                bucket_for_call[bucket.first_global_call_index..stop].fill(Some(bucket.index));
+            }
+        }
         Ok(Self {
             document,
             nvperf_library,
@@ -373,6 +401,7 @@ impl Analysis {
             calls,
             timestamps,
             timing_buckets,
+            bucket_for_call,
             frames,
             debug_groups,
             nvtx_ranges,
@@ -412,6 +441,10 @@ impl Analysis {
         &self.nvtx_ranges
     }
 
+    pub fn info_tables(&self) -> Vec<InfoTable> {
+        info_tables(self.document.message()).unwrap_or_default()
+    }
+
     pub fn overview(&self) -> serde_json::Value {
         let call_histogram = histogram(self.calls.iter().map(|call| call.name.as_str()));
         let call_kinds = histogram(self.calls.iter().map(|call| call.kind));
@@ -428,7 +461,7 @@ impl Analysis {
             "descriptor_files": self.document.descriptor_set().file.iter().filter_map(|file| file.name.as_deref()).collect::<Vec<_>>(),
             "unknown_wire_fields": self.document.unknown_field_count(),
             "apis": self.api_names,
-            "info_tables": info_tables(self.document.message()).unwrap_or_default(),
+            "info_tables": self.info_tables(),
             "calls": {
                 "count": self.calls.len(),
                 "actions": self.calls.iter().filter(|call| call.kind.is_action()).count(),
@@ -548,18 +581,131 @@ impl Analysis {
         if id == "capture" {
             return Ok(self.capture_scope());
         }
-        for kind in [
-            ScopeKind::DebugGroup,
-            ScopeKind::Frame,
-            ScopeKind::Action,
-            ScopeKind::TimingBucket,
-            ScopeKind::NvtxRange,
-        ] {
-            if let Some(scope) = self.scopes(kind)?.into_iter().find(|scope| scope.id == id) {
-                return Ok(scope);
+        if let Some(group) = self.debug_groups.iter().find(|group| group.id == id) {
+            let mut scope = self.scope_for_calls(
+                group.call_start,
+                group.call_stop,
+                ScopeKind::DebugGroup,
+                group.id.clone(),
+                group.name.clone(),
+            )?;
+            if !group.closed {
+                scope
+                    .warnings
+                    .push("Debug group is not closed in the capture.".into());
             }
+            return Ok(scope);
+        }
+        if let Some(frame) = self.frames.iter().find(|frame| frame.id == id) {
+            return Ok(Scope {
+                kind: ScopeKind::Frame,
+                id: frame.id.clone(),
+                label: format!("{} frame {}", frame.kind, frame.index),
+                start_ns: Some(frame.start_ns),
+                end_ns: Some(frame.end_ns),
+                call_start: None,
+                call_stop: None,
+                sample_start: None,
+                sample_stop: None,
+                precision: "frame_timestamps".into(),
+                warnings: Vec::new(),
+            });
+        }
+        if let Some(range) = self.nvtx_ranges.iter().find(|range| range.id == id) {
+            return Ok(Scope {
+                kind: ScopeKind::NvtxRange,
+                id: range.id.clone(),
+                label: range.name.clone(),
+                start_ns: Some(range.start),
+                end_ns: Some(range.end),
+                call_start: None,
+                call_stop: None,
+                sample_start: None,
+                sample_stop: None,
+                precision: "nvtx_clock_unvalidated".into(),
+                warnings: vec!["Legacy NVTX clock is not assumed to match GPU PTIMER.".into()],
+            });
+        }
+        if let Some(index) = id
+            .strip_prefix("action:")
+            .and_then(|value| value.parse::<usize>().ok())
+            && let Some(call) = self
+                .calls
+                .iter()
+                .filter(|call| call.kind.is_action())
+                .nth(index)
+        {
+            return self.scope_for_calls(
+                call.global_index,
+                call.global_index + 1,
+                ScopeKind::Action,
+                id,
+                format!("{} (global call {})", call.name, call.global_index),
+            );
+        }
+        if let Some(index) = id
+            .strip_prefix("bucket:")
+            .and_then(|value| value.parse::<usize>().ok())
+            && let Some(bucket) = self.timing_buckets.get(index)
+        {
+            return self.scope_for_calls(
+                bucket.first_global_call_index,
+                bucket.next_global_call_index,
+                ScopeKind::TimingBucket,
+                id,
+                format!("timing bucket {}", bucket.index),
+            );
         }
         Err(Error::TracePath(format!("unknown scope ID {id:?}")))
+    }
+
+    /// Build an NVTX scope using a caller-supplied clock offset. The analyzer
+    /// does not guess the offset; the residual is reported as a warning so the
+    /// caller can decide whether the attribution is usable.
+    pub fn scope_for_nvtx(
+        &self,
+        id: &str,
+        offset_ns: i64,
+        residual_ns: Option<u64>,
+    ) -> Result<Scope> {
+        let range = self
+            .nvtx_ranges
+            .iter()
+            .find(|range| range.id == id)
+            .ok_or_else(|| Error::TracePath(format!("unknown NVTX scope ID {id:?}")))?;
+        let shift = |value: u64| -> Result<u64> {
+            let shifted = i128::from(value) + i128::from(offset_ns);
+            u64::try_from(shifted)
+                .map_err(|_| Error::TracePath(format!("NVTX clock offset underflows range {id:?}")))
+        };
+        let start_ns = shift(range.start)?;
+        let end_ns = shift(range.end)?;
+        if end_ns <= start_ns {
+            return Err(Error::TracePath(format!(
+                "NVTX clock offset produces an empty range for {id:?}"
+            )));
+        }
+        let mut warnings = vec![format!(
+            "NVTX clock shifted by caller-supplied {offset_ns} ns; this is not an automatic calibration."
+        )];
+        if let Some(residual) = residual_ns {
+            warnings.push(format!(
+                "Caller-reported NVTX clock residual is {residual} ns; verify it is small relative to the scope duration."
+            ));
+        }
+        Ok(Scope {
+            kind: ScopeKind::NvtxRange,
+            id: range.id.clone(),
+            label: range.name.clone(),
+            start_ns: Some(start_ns),
+            end_ns: Some(end_ns),
+            call_start: None,
+            call_stop: None,
+            sample_start: None,
+            sample_stop: None,
+            precision: "nvtx_clock_offset".into(),
+            warnings,
+        })
     }
 
     /// Parse the scope syntax accepted by the CLI and MCP server.
@@ -653,15 +799,31 @@ impl Analysis {
                 warnings: vec!["Scope contains no captured API calls.".into()],
             });
         }
-        let buckets: Vec<_> = self
-            .timing_buckets
-            .iter()
-            .filter(|bucket| {
-                bucket.first_global_call_index < stop
-                    && bucket.next_global_call_index > start
-                    && bucket.interval().is_some()
-            })
-            .collect();
+        let bucket_indices = self
+            .bucket_for_call
+            .get(start)
+            .copied()
+            .flatten()
+            .zip(self.bucket_for_call.get(stop - 1).copied().flatten());
+        let buckets: Vec<_> = match bucket_indices {
+            Some((first, last)) => self.timing_buckets[first.min(last)..=first.max(last)]
+                .iter()
+                .filter(|bucket| {
+                    bucket.first_global_call_index < stop
+                        && bucket.next_global_call_index > start
+                        && bucket.interval().is_some()
+                })
+                .collect(),
+            None => self
+                .timing_buckets
+                .iter()
+                .filter(|bucket| {
+                    bucket.first_global_call_index < stop
+                        && bucket.next_global_call_index > start
+                        && bucket.interval().is_some()
+                })
+                .collect(),
+        };
         if buckets.is_empty() {
             return Ok(Scope {
                 kind,
@@ -1363,6 +1525,7 @@ pub fn metric_statistics(
             selected_samples: rows.len(),
             coverage_pct: 0.0,
             mean: None,
+            stddev: None,
             min: None,
             min_range_index: None,
             max: None,
@@ -1378,6 +1541,23 @@ pub fn metric_statistics(
         .iter()
         .map(|(value, duration, _)| value * *duration as f64)
         .sum();
+    let mean = if covered_duration == 0 {
+        0.0
+    } else {
+        weighted_sum / covered_duration as f64
+    };
+    let variance = if covered_duration == 0 {
+        0.0
+    } else {
+        values
+            .iter()
+            .map(|(value, duration, _)| {
+                let delta = value - mean;
+                delta * delta * *duration as f64
+            })
+            .sum::<f64>()
+            / covered_duration as f64
+    };
     let min = values
         .iter()
         .min_by(|left, right| left.0.total_cmp(&right.0))
@@ -1386,39 +1566,65 @@ pub fn metric_statistics(
         .iter()
         .max_by(|left, right| left.0.total_cmp(&right.0))
         .unwrap();
-    let mut sorted: Vec<_> = values.iter().map(|item| item.0).collect();
-    sorted.sort_by(f64::total_cmp);
+    let mut weighted: Vec<_> = values
+        .iter()
+        .map(|(value, duration, _)| (*value, *duration))
+        .collect();
+    weighted.sort_by(|left, right| left.0.total_cmp(&right.0));
     MetricStatistics {
         valid_samples: values.len(),
         selected_samples: rows.len(),
         coverage_pct: if selected_duration == 0 {
             0.0
         } else {
-            100.0 * covered_duration as f64 / selected_duration as f64
+            (100.0 * covered_duration as f64 / selected_duration as f64).min(100.0)
         },
-        mean: Some(weighted_sum / covered_duration as f64),
+        mean: Some(mean),
+        stddev: Some(variance.sqrt()),
         min: Some(min.0),
         min_range_index: Some(min.2),
         max: Some(max.0),
         max_range_index: Some(max.2),
-        p50: Some(percentile(&sorted, 0.50)),
-        p95: Some(percentile(&sorted, 0.95)),
-        sum: Some(sorted.iter().sum()),
+        p50: Some(weighted_percentile_pairs(&weighted, 0.50)),
+        p95: Some(weighted_percentile_pairs(&weighted, 0.95)),
+        sum: Some(values.iter().map(|item| item.0).sum()),
     }
 }
 
-fn percentile(sorted: &[f64], fraction: f64) -> f64 {
-    if sorted.len() == 1 {
-        return sorted[0];
+fn weighted_percentile_pairs(sorted: &[(f64, u64)], fraction: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
     }
-    let position = (sorted.len() - 1) as f64 * fraction;
-    let lower = position.floor() as usize;
-    let upper = position.ceil() as usize;
-    if lower == upper {
-        sorted[lower]
-    } else {
-        sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower as f64)
+    let total: u64 = sorted.iter().map(|(_, weight)| *weight).sum();
+    if total == 0 {
+        let position = (sorted.len() - 1) as f64 * fraction;
+        let lower = position.floor() as usize;
+        let upper = position.ceil() as usize;
+        return if lower == upper {
+            sorted[lower].0
+        } else {
+            sorted[lower].0 + (sorted[upper].0 - sorted[lower].0) * (position - lower as f64)
+        };
     }
+    let target = total as f64 * fraction;
+    let mut cumulative = 0.0f64;
+    let mut previous: Option<(f64, f64)> = None;
+    for (value, weight) in sorted {
+        let midpoint = cumulative + *weight as f64 / 2.0;
+        if midpoint >= target {
+            return match previous {
+                Some((previous_value, previous_midpoint)) if midpoint > previous_midpoint => {
+                    let interpolation =
+                        (target - previous_midpoint) / (midpoint - previous_midpoint);
+                    previous_value + (*value - previous_value) * interpolation
+                }
+                _ => *value,
+            };
+        }
+        cumulative += *weight as f64;
+        previous = Some((*value, midpoint));
+    }
+    sorted.last().map(|(value, _)| *value).unwrap_or(0.0)
 }
 
 fn parse_range<T>(value: &str) -> Result<(T, T)>
@@ -1579,11 +1785,11 @@ fn build_timing_buckets(
             .iter()
             .filter_map(|(stage, start)| {
                 current_values.get(stage).and_then(|end| {
-                    end.checked_sub(*start).map(|duration_ns| TimingStage {
+                    (*start > 0 && *end > *start).then(|| TimingStage {
                         stage: stage.clone(),
                         start_ptimer: *start,
                         end_ptimer: *end,
-                        duration_ns,
+                        duration_ns: *end - *start,
                     })
                 })
             })
@@ -1719,21 +1925,19 @@ fn index_nvtx(trace: &DynamicMessage) -> Result<Vec<NvtxRange>> {
     Ok(result)
 }
 
-fn info_tables(trace: &DynamicMessage) -> Result<Vec<serde_json::Value>> {
+fn info_tables(trace: &DynamicMessage) -> Result<Vec<InfoTable>> {
     message_items(trace, "InfoTables")?
         .map(|table| {
             let entries = message_items(table, "TableEntries")?
-                .map(|entry| {
-                    serde_json::json!({
-                        "name": optional_string(entry, "Name"),
-                        "value": optional_string(entry, "Value"),
-                    })
+                .map(|entry| InfoEntry {
+                    name: optional_string(entry, "Name"),
+                    value: optional_string(entry, "Value"),
                 })
                 .collect::<Vec<_>>();
-            Ok(serde_json::json!({
-                "name": optional_string(table, "TableName"),
-                "entries": entries,
-            }))
+            Ok(InfoTable {
+                name: optional_string(table, "TableName"),
+                entries,
+            })
         })
         .collect()
 }

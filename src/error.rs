@@ -32,6 +32,9 @@ pub enum Error {
 
     #[error("trace path error: {0}")]
     TracePath(String),
+
+    #[error("shader/profiler error: {0}")]
+    Shader(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -13,17 +13,28 @@
 //! never replace unavailable values with zero or hide timing ambiguity.
 
 pub mod analysis;
+pub mod compare;
 pub mod container;
 pub mod diagnostics;
 mod error;
 pub mod mcp;
 pub mod perfworks;
+pub mod quality;
+pub mod shader;
+pub mod state;
+pub mod timeline;
 pub mod trace;
 
 pub use analysis::{
-    Analysis, AnalysisOptions, ApiCall, CallKind, DebugGroup, Frame, MetricStatistic,
-    MetricStatistics, NvtxRange, RankedScope, Scope, ScopeKind, ScopeMetricAggregation,
-    ScopeMetricSummary, ScopeRanking, ScopedMetrics, TimestampBoundary, TimingBucket,
+    Analysis, AnalysisOptions, ApiCall, CallKind, DebugGroup, Frame, InfoEntry, InfoTable,
+    MetricStatistic, MetricStatistics, NvtxRange, RankedScope, Scope, ScopeKind,
+    ScopeMetricAggregation, ScopeMetricSummary, ScopeRanking, ScopedMetrics, TimestampBoundary,
+    TimingBucket,
+};
+pub use compare::{
+    CaptureComparison, CaptureReference, Comparability, ComparabilityWarning, CompareOptions,
+    MetricDelta, MetricValues, ScopeDelta, ScopeMetricDelta, ShaderChange, ShaderDelta,
+    ShaderValues, compare_captures,
 };
 pub use container::{Chunk, Container, Section, SectionRole};
 pub use diagnostics::{
@@ -35,5 +46,19 @@ pub use perfworks::{
     CounterImage, CounterImageInfo, MetricAvailability, MetricBase, MetricCatalog,
     MetricDescriptor, MetricEvaluation, MetricKind, MetricSample, MetricScan, MetricsApi,
     PerfWorks, SampleInfo,
+};
+pub use quality::{
+    CaptureEnvironment, CaptureQuality, CounterCoverage, QualityCheck, QualityStatus,
+    TimingCoverage,
+};
+pub use shader::{
+    BlobInfo, BlobKind, DeviceShaders, Disassembly, ModuleInfo, OccupancyEstimate,
+    PcSamplingStatistics, PcSamplingSummary, SassFunctionStats, SassSourceLine, SassStats,
+    ShaderCatalog, ShaderInfo, disassemble, load_keystream, recover_keystream,
+};
+pub use state::{ActionState, BarrierEvidence, BoundObject};
+pub use timeline::{
+    FramePacing, FrameSummary, Timeline, TimelineGap, TimelineInterval, TimelineLane,
+    TimelineOptions,
 };
 pub use trace::{ByteField, QueryOptions, SchemaField, TraceDocument};

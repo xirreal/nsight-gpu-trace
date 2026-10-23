@@ -78,6 +78,48 @@ two adjacent boundaries applies to calls in `[previous.NextCallIndex,
 current.NextCallIndex)`. The first boundary provides no start time for calls
 before it.
 
+## Shader Profiler blobs
+
+`devices[i].ShaderProfilerReport` is a `NV.ShaderProfiler.Messages.PbReport`.
+Its `blobTable.blobs` entries carry `id`, `data`, `uncompressedSize`,
+`compression`, and `obfuscation`:
+
+| Enum | Value | Meaning |
+|---|---|---|
+| `PbCompression` | `1` | stored |
+| `PbCompression` | `2` | raw LZ4 block |
+| `PbObfuscation` | `1` | none |
+| `PbObfuscation` | `2` | simple XOR stream |
+
+`pcCountersInfo.pcSamplingSession` maps `codeBlocks` to `functionGroups` and
+`modules`. A `PbShaderInstance.debugInfo.ref.idx` points at an ELF/cubin blob;
+`instructions.idx` points at the captured SASS payload. CUDA code blocks use
+`PbCuFunction` and the cubin on the matching `PbModule.cuModule`.
+
+The simple obfuscation is XOR with a stream reused across blobs and across
+captures from the same producer. Consequently any known plaintext (for example
+a SPIR-V module from the same build) recovers the stream for the rest of the
+capture. The validated stream for Nsight Graphics 2026.3 is shipped as
+`assets/shader_profiler_keystream.bin`; a different producer can be handled with
+an explicit stream or recovered plaintext.
+
+The stream was audited on 12 Nsight Graphics 2026.3 captures containing 664
+`OBFUSCATION_SIMPLE` blobs. Decoding every blob with the shipped stream produced
+zero errors. Recovering the stream independently from a decoded SPIR-V
+plaintext in each capture produced a prefix that matched the shipped stream in
+every case; the longest recovered stream was 239,592 bytes, equal to the shipped
+asset. Cross-decoding every shader-bearing capture with one recovered stream
+produced zero failures. The stream is therefore static for these captures, not
+per-capture.
+
+After LZ4 decompression and stream removal, ELF blobs parse as driver cubins.
+`ngfx-trace sass` writes that cubin and runs `nvdisasm`; SASS register liveness
+requires a flow-analysis-compatible ELF, so the tool falls back to `-c -g` when
+`-plr -lrm count` is rejected. A second `nvdisasm --emit-json -c -g` pass
+provides structured instruction statistics, and the `-g` text is parsed for
+source-line instruction counts. Occupancy is a static estimate from registers,
+block size, and static shared memory, not a runtime measurement.
+
 ## PerfWorks counter data
 
 Section 1 begins with `LOPDATA\0` after concatenation and decompression. The

@@ -21,7 +21,7 @@ use serde::Serialize;
 use crate::{
     Error, Result,
     container::{Container, SectionRole},
-    trace::{find_named_file, nsight_search_roots},
+    trace::{find_named_file, nsight_search_roots, sort_by_newest},
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -204,13 +204,26 @@ pub struct MetricAvailability {
     pub base_name: String,
     pub metric_name: String,
     pub kind: MetricKind,
+    /// Best-effort unit family from the canonical name. It is not a substitute
+    /// for the evaluator's dimensional metadata.
+    pub unit_hint: String,
     pub valid_samples: usize,
     pub selected_samples: usize,
     pub sample_coverage_pct: f64,
     pub nonzero_samples: usize,
+    /// Unweighted arithmetic mean of finite samples.
     pub sample_mean: Option<f64>,
+    /// Mean weighted by each sample's timestamp duration when available.
+    pub time_weighted_mean: Option<f64>,
     pub min: Option<f64>,
     pub max: Option<f64>,
+    pub p50: Option<f64>,
+    pub p95: Option<f64>,
+    pub stddev: Option<f64>,
+    /// `p95 / time_weighted_mean`, useful for distinguishing bursts from
+    /// sustained pressure. `null` when the weighted mean is unavailable or zero.
+    pub burst_ratio: Option<f64>,
+    pub peak_sample_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +232,9 @@ pub struct MetricScan {
     pub sample_start: usize,
     pub sample_stop: usize,
     pub selected_samples: usize,
+    pub timestamped_samples: usize,
+    pub complete_samples: usize,
+    pub sample_duration_ns: u64,
     pub metrics: Vec<MetricAvailability>,
 }
 
@@ -613,6 +629,9 @@ impl PerfWorks {
                 sample_start: first,
                 sample_stop: final_index,
                 selected_samples: final_index - first,
+                timestamped_samples: 0,
+                complete_samples: 0,
+                sample_duration_ns: 0,
                 metrics: Vec::new(),
             });
         }
@@ -643,6 +662,7 @@ impl PerfWorks {
             sum: f64,
             min: f64,
             max: f64,
+            peak_sample_index: Option<usize>,
         }
         let mut accumulators = vec![
             Accumulator {
@@ -651,11 +671,28 @@ impl PerfWorks {
                 sum: 0.0,
                 min: f64::INFINITY,
                 max: f64::NEG_INFINITY,
+                peak_sample_index: None,
             };
             requests.len()
         ];
+        // Values are retained per metric so p50/p95 and burst ratios describe
+        // the collection window rather than only its arithmetic mean. A typical
+        // capture has hundreds of samples and hundreds of collected metrics.
+        let mut measured: Vec<Vec<(f64, f64)>> = vec![Vec::new(); requests.len()];
         let mut values = vec![f64::NAN; requests.len()];
+        let mut timestamped_samples = 0usize;
+        let mut complete_samples = 0usize;
+        let mut sample_duration_ns = 0u64;
         for range_index in first..final_index {
+            let sample = self.sample_info(image, range_index)?;
+            timestamped_samples += usize::from(sample.timestamp_valid);
+            complete_samples += usize::from(sample.complete);
+            let weight = if sample.timestamp_valid {
+                sample_duration_ns += sample.duration_ns.unwrap_or(0);
+                sample.duration_ns.unwrap_or(1).max(1) as f64
+            } else {
+                1.0
+            };
             values.fill(f64::NAN);
             let mut params = NvEvaluateMetrics {
                 struct_size: field_end::<NvEvaluateMetrics>(
@@ -675,14 +712,20 @@ impl PerfWorks {
                 values: values.as_mut_ptr(),
             };
             self.call(b"NVPW_MetricsEvaluator_EvaluateToGpuValues\0", &mut params)?;
-            for (value, accumulator) in values.iter().zip(&mut accumulators) {
-                if value.is_finite() {
-                    accumulator.valid += 1;
-                    accumulator.nonzero += usize::from(*value != 0.0);
-                    accumulator.sum += value;
-                    accumulator.min = accumulator.min.min(*value);
-                    accumulator.max = accumulator.max.max(*value);
+            for (index, value) in values.iter().enumerate() {
+                if !value.is_finite() {
+                    continue;
                 }
+                let accumulator = &mut accumulators[index];
+                accumulator.valid += 1;
+                accumulator.nonzero += usize::from(*value != 0.0);
+                accumulator.sum += value;
+                accumulator.min = accumulator.min.min(*value);
+                if *value > accumulator.max {
+                    accumulator.max = *value;
+                    accumulator.peak_sample_index = Some(range_index);
+                }
+                measured[index].push((*value, weight));
             }
         }
 
@@ -691,29 +734,47 @@ impl PerfWorks {
             .iter()
             .zip(names)
             .zip(accumulators)
-            .map(|((base, metric_name), accumulator)| MetricAvailability {
-                base_name: base.name.clone(),
-                metric_name,
-                kind: base.kind,
-                valid_samples: accumulator.valid,
-                selected_samples,
-                sample_coverage_pct: if selected_samples == 0 {
-                    0.0
-                } else {
-                    100.0 * accumulator.valid as f64 / selected_samples as f64
+            .zip(measured)
+            .map(
+                |(((base, metric_name), accumulator), mut values)| MetricAvailability {
+                    base_name: base.name.clone(),
+                    unit_hint: metric_unit_hint(&metric_name, base.kind).into(),
+                    metric_name,
+                    kind: base.kind,
+                    valid_samples: accumulator.valid,
+                    selected_samples,
+                    sample_coverage_pct: if selected_samples == 0 {
+                        0.0
+                    } else {
+                        100.0 * accumulator.valid as f64 / selected_samples as f64
+                    },
+                    nonzero_samples: accumulator.nonzero,
+                    sample_mean: (accumulator.valid > 0)
+                        .then_some(accumulator.sum / accumulator.valid as f64),
+                    time_weighted_mean: weighted_mean(&values),
+                    min: (accumulator.valid > 0).then_some(accumulator.min),
+                    max: (accumulator.valid > 0).then_some(accumulator.max),
+                    p50: weighted_percentile(&mut values, 0.50),
+                    p95: weighted_percentile(&mut values, 0.95),
+                    stddev: sample_stddev(&values),
+                    burst_ratio: {
+                        let mean = weighted_mean(&values);
+                        weighted_percentile(&mut values, 0.95)
+                            .zip(mean)
+                            .and_then(|(p95, mean)| (mean > 0.0).then_some(p95 / mean))
+                    },
+                    peak_sample_index: accumulator.peak_sample_index,
                 },
-                nonzero_samples: accumulator.nonzero,
-                sample_mean: (accumulator.valid > 0)
-                    .then_some(accumulator.sum / accumulator.valid as f64),
-                min: (accumulator.valid > 0).then_some(accumulator.min),
-                max: (accumulator.valid > 0).then_some(accumulator.max),
-            })
+            )
             .collect();
         Ok(MetricScan {
             chip_name: info.chip_name,
             sample_start: first,
             sample_stop: final_index,
             selected_samples,
+            timestamped_samples,
+            complete_samples,
+            sample_duration_ns,
             metrics,
         })
     }
@@ -1177,7 +1238,7 @@ pub fn discover_nvperf_library(explicit: Option<&Path>) -> Result<PathBuf> {
     for root in &roots {
         find_named_file(root, NVPERF_FILENAME, 7, &mut candidates);
     }
-    candidates.sort();
+    sort_by_newest(&mut candidates);
     candidates.pop().ok_or(Error::Discovery {
         kind: "PerfWorks host library (set NGFX_NVPERF_LIBRARY)",
         searched: roots,
@@ -1198,6 +1259,94 @@ fn require_nvperf(path: &Path) -> Result<PathBuf> {
 fn field_end<T>(offset: usize, field_size: usize) -> usize {
     let _ = std::marker::PhantomData::<T>;
     offset + field_size
+}
+
+fn metric_unit_hint(metric_name: &str, kind: MetricKind) -> &'static str {
+    let name = metric_name.to_ascii_lowercase();
+    if name.contains("pct_of_peak") || name.contains("percent") {
+        "percent_of_peak"
+    } else if kind == MetricKind::Ratio || name.ends_with(".ratio") {
+        "ratio"
+    } else if name.contains("bytes") {
+        "bytes_or_native"
+    } else if name.contains("cycles") {
+        "cycles"
+    } else if name.contains("_ns") || name.contains("duration") || name.contains("_time") {
+        "nanoseconds_or_native"
+    } else {
+        "native"
+    }
+}
+
+fn weighted_mean(values: &[(f64, f64)]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let total_weight: f64 = values.iter().map(|(_, weight)| *weight).sum();
+    if total_weight <= 0.0 {
+        return Some(values.iter().map(|(value, _)| *value).sum::<f64>() / values.len() as f64);
+    }
+    Some(
+        values
+            .iter()
+            .map(|(value, weight)| value * weight)
+            .sum::<f64>()
+            / total_weight,
+    )
+}
+
+fn weighted_percentile(values: &mut [(f64, f64)], fraction: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let total_weight: f64 = values.iter().map(|(_, weight)| *weight).sum();
+    if total_weight <= 0.0 {
+        let position = (values.len() - 1) as f64 * fraction;
+        let lower = position.floor() as usize;
+        let upper = position.ceil() as usize;
+        if lower == upper {
+            return Some(values[lower].0);
+        }
+        return Some(
+            values[lower].0 + (values[upper].0 - values[lower].0) * (position - lower as f64),
+        );
+    }
+    let target = total_weight * fraction;
+    let mut cumulative = 0.0;
+    let mut previous: Option<(f64, f64)> = None;
+    for (value, weight) in values.iter() {
+        let midpoint = cumulative + *weight / 2.0;
+        if midpoint >= target {
+            return Some(match previous {
+                Some((previous_value, previous_midpoint)) if midpoint > previous_midpoint => {
+                    let interpolation =
+                        (target - previous_midpoint) / (midpoint - previous_midpoint);
+                    previous_value + (*value - previous_value) * interpolation
+                }
+                _ => *value,
+            });
+        }
+        cumulative += *weight;
+        previous = Some((*value, midpoint));
+    }
+    values.last().map(|(value, _)| *value)
+}
+
+fn sample_stddev(values: &[(f64, f64)]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mean = values.iter().map(|(value, _)| *value).sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|(value, _)| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    Some(variance.sqrt())
 }
 
 fn metric_request_size() -> usize {

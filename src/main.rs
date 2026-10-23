@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -7,8 +7,10 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nsight_gpu_trace::{
-    Analysis, AnalysisOptions, ByteField, CallKind, Container, Error, McpServer, MetricKind,
-    QueryOptions, Result, ScopeKind, SectionRole, TraceDocument, top_down_report,
+    Analysis, AnalysisOptions, ByteField, CallKind, CompareOptions, Container, Error, McpServer,
+    MetricKind, QueryOptions, Result, ScopeKind, SectionRole, ShaderCatalog, TimelineOptions,
+    TraceDocument, compare_captures, disassemble, load_keystream, recover_keystream,
+    top_down_report,
 };
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
@@ -52,6 +54,49 @@ enum Command {
         /// Also materialize and inspect the PerfWorks counter image.
         #[arg(long)]
         with_counters: bool,
+    },
+
+    /// Report measurement coverage, environment identity, and capture settings.
+    Quality { trace: PathBuf },
+
+    /// Report queue lanes, gaps, overlap, and frame pacing.
+    Timeline {
+        trace: PathBuf,
+        /// Omit gaps shorter than this many nanoseconds.
+        #[arg(long, default_value_t = 1000)]
+        min_gap_ns: u64,
+    },
+
+    /// Compare two captures without deciding whether a change is good.
+    Compare {
+        baseline: PathBuf,
+        candidate: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Scope family used for per-region deltas.
+        #[arg(long, value_enum)]
+        scope_kind: Option<CliScopeKind>,
+        /// Case-insensitive regex matched against scope IDs and labels.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Exact metrics used for per-scope deltas. Repeatable.
+        #[arg(long = "metric")]
+        metrics: Vec<String>,
+        /// Skip Shader Profiler/cubin comparison.
+        #[arg(long)]
+        no_shaders: bool,
+    },
+
+    /// Show observed bindings and barrier counts for draw/dispatch actions.
+    Actions {
+        trace: PathBuf,
+        #[arg(long, value_enum)]
+        kind: Option<CliCallKind>,
+        /// Case-insensitive regex matched against action names.
+        #[arg(long)]
+        filter: Option<String>,
+        #[command(flatten)]
+        page: PageArgs,
     },
 
     /// Describe all protobuf fields at a dynamic trace path.
@@ -134,6 +179,56 @@ enum Command {
         top: usize,
     },
 
+    /// List Shader Profiler shaders, blobs, and attached cubins.
+    Shaders {
+        trace: PathBuf,
+        /// Case-insensitive regular expression matched against shader names and stages.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Restrict output to one trace device index.
+        #[arg(long)]
+        device: Option<usize>,
+        /// Include the complete blob table metadata for each device.
+        #[arg(long)]
+        blobs: bool,
+        /// Explicit XOR stream file.
+        #[arg(long)]
+        keystream: Option<PathBuf>,
+        /// Recover the XOR stream from a known plaintext shader/SPIR-V file.
+        #[arg(long)]
+        known_plaintext: Option<PathBuf>,
+        #[command(flatten)]
+        page: PageArgs,
+    },
+
+    /// Extract one shader's cubin and disassemble it with nvdisasm.
+    Sass {
+        trace: PathBuf,
+        /// Shader index from `shaders`, or a case-insensitive name/entry-point regex.
+        selector: Option<String>,
+        /// Restrict selection to one trace device index.
+        #[arg(long)]
+        device: Option<usize>,
+        /// Write SASS text to this file instead of embedding it in JSON.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Write the decoded ELF/cubin to this file.
+        #[arg(long = "cubin")]
+        cubin_output: Option<PathBuf>,
+        /// Extract the cubin without invoking nvdisasm.
+        #[arg(long)]
+        no_disassemble: bool,
+        /// Explicit nvdisasm executable.
+        #[arg(long)]
+        nvdisasm: Option<PathBuf>,
+        /// Explicit XOR stream file.
+        #[arg(long)]
+        keystream: Option<PathBuf>,
+        /// Recover the XOR stream from a known plaintext shader/SPIR-V file.
+        #[arg(long)]
+        known_plaintext: Option<PathBuf>,
+    },
+
     /// Inventory every populated protobuf byte field.
     Artifacts {
         trace: PathBuf,
@@ -198,6 +293,12 @@ enum MetricsCommand {
         /// capture, a stable scope ID, calls:A..B, samples:A..B, time:A..B, or relative-time:A..B.
         #[arg(long, default_value = "capture")]
         scope: String,
+        /// Shift a selected NVTX scope by this many nanoseconds before metric attribution.
+        #[arg(long)]
+        nvtx_offset_ns: Option<i64>,
+        /// Caller-reported residual for the NVTX clock shift.
+        #[arg(long)]
+        nvtx_residual_ns: Option<u64>,
         /// Include the complete selected sample series as well as aggregates.
         #[arg(long)]
         sample_series: bool,
@@ -347,6 +448,58 @@ fn run() -> Result<()> {
             }
             overview
         }
+        Command::Quality { trace } => {
+            let mut analysis = Analysis::open(trace, options)?;
+            serde_json::to_value(analysis.quality()?)?
+        }
+        Command::Timeline { trace, min_gap_ns } => {
+            let analysis = Analysis::open(trace, options)?;
+            serde_json::to_value(analysis.timeline(TimelineOptions { min_gap_ns }))?
+        }
+        Command::Compare {
+            baseline,
+            candidate,
+            top,
+            scope_kind,
+            filter,
+            metrics,
+            no_shaders,
+        } => {
+            let mut baseline = Analysis::open(baseline, options.clone())?;
+            let mut candidate = Analysis::open(candidate, options)?;
+            let options = CompareOptions {
+                top,
+                scope_kind: scope_kind.map(ScopeKind::from),
+                scope_pattern: filter
+                    .as_deref()
+                    .map(|pattern| RegexBuilder::new(pattern).case_insensitive(true).build())
+                    .transpose()?,
+                include_shaders: !no_shaders,
+                scope_metrics: metrics,
+            };
+            serde_json::to_value(compare_captures(&mut baseline, &mut candidate, &options)?)?
+        }
+        Command::Actions {
+            trace,
+            kind,
+            filter,
+            page,
+        } => {
+            let analysis = Analysis::open(trace, options)?;
+            let regex = compile_filter(filter.as_deref())?;
+            let kind = kind.map(CallKind::from);
+            let states: Vec<_> = analysis
+                .action_states()
+                .into_iter()
+                .filter(|state| kind.is_none_or(|kind| state.kind == kind))
+                .filter(|state| {
+                    regex
+                        .as_ref()
+                        .is_none_or(|regex| regex.is_match(&state.name))
+                })
+                .collect();
+            page_value(&states, &page)?
+        }
         Command::Schema { trace, path } => {
             let document = open_document(trace, &options)?;
             json!({ "path": path, "fields": document.schema(&path)? })
@@ -445,16 +598,60 @@ fn run() -> Result<()> {
         Command::Metrics { command } => metrics_command(command, options)?,
         Command::Report { trace, top } => {
             let mut analysis = Analysis::open(trace, options)?;
+            let quality = analysis.quality()?;
             let overview = analysis.overview();
+            let timeline = analysis.timeline(TimelineOptions { min_gap_ns: 1000 });
             let counter_info = analysis.counter_info()?.clone();
             let catalog = analysis.metric_catalog()?;
             let scan = analysis.scan_metrics(&catalog.metrics, 0, None)?;
             json!({
                 "capture": overview,
+                "quality": quality,
+                "timeline": timeline,
                 "counter_image": counter_info,
                 "diagnostics": top_down_report(&scan, top),
             })
         }
+        Command::Shaders {
+            trace,
+            filter,
+            device,
+            blobs,
+            keystream,
+            known_plaintext,
+            page,
+        } => shader_inventory(
+            trace,
+            &options,
+            filter.as_deref(),
+            device,
+            blobs,
+            keystream.as_deref(),
+            known_plaintext.as_deref(),
+            &page,
+        )?,
+        Command::Sass {
+            trace,
+            selector,
+            device,
+            output,
+            cubin_output,
+            no_disassemble,
+            nvdisasm,
+            keystream,
+            known_plaintext,
+        } => sass(
+            trace,
+            &options,
+            selector.as_deref(),
+            device,
+            output.as_deref(),
+            cubin_output.as_deref(),
+            no_disassemble,
+            nvdisasm.as_deref(),
+            keystream.as_deref(),
+            known_plaintext.as_deref(),
+        )?,
         Command::Artifacts {
             trace,
             filter,
@@ -556,10 +753,18 @@ fn metrics_command(command: MetricsCommand, options: AnalysisOptions) -> Result<
             trace,
             metrics,
             scope,
+            nvtx_offset_ns,
+            nvtx_residual_ns,
             sample_series,
         } => {
             let mut analysis = Analysis::open(trace, options)?;
-            let scope = analysis.parse_scope(&scope)?;
+            let scope = if let Some(offset) = nvtx_offset_ns
+                && scope.starts_with("nvtx:")
+            {
+                analysis.scope_for_nvtx(&scope, offset, nvtx_residual_ns)?
+            } else {
+                analysis.parse_scope(&scope)?
+            };
             let report = analysis.evaluate_scope(&scope, &metrics)?;
             if sample_series {
                 Ok(serde_json::to_value(report)?)
@@ -625,6 +830,240 @@ fn metrics_command(command: MetricsCommand, options: AnalysisOptions) -> Result<
 
 fn open_document(path: PathBuf, options: &AnalysisOptions) -> Result<TraceDocument> {
     TraceDocument::open(path, options.schema_binary.as_deref())
+}
+
+fn shader_catalog(
+    document: &TraceDocument,
+    keystream: Option<&Path>,
+    known_plaintext: Option<&Path>,
+) -> Result<ShaderCatalog> {
+    let (key, source) = if let Some(known) = known_plaintext {
+        recover_keystream(document, known)?
+    } else {
+        load_keystream(keystream)?
+    };
+    ShaderCatalog::open(document, &key, &source)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shader_inventory(
+    trace: PathBuf,
+    options: &AnalysisOptions,
+    filter: Option<&str>,
+    device: Option<usize>,
+    include_blobs: bool,
+    keystream: Option<&Path>,
+    known_plaintext: Option<&Path>,
+    page: &PageArgs,
+) -> Result<Value> {
+    let document = open_document(trace, options)?;
+    let catalog = shader_catalog(&document, keystream, known_plaintext)?;
+    let regex = compile_filter(filter)?;
+    let shaders: Vec<_> = catalog
+        .shaders()
+        .filter(|shader| device.is_none_or(|value| shader.device_index == value))
+        .filter(|shader| {
+            regex.as_ref().is_none_or(|regex| {
+                [
+                    shader.name.as_str(),
+                    shader.entry_point.as_deref().unwrap_or(""),
+                    shader.source_file.as_deref().unwrap_or(""),
+                    shader.stage.as_str(),
+                    shader.shader_type.as_str(),
+                    shader.origin.as_str(),
+                    shader.pipeline.as_deref().unwrap_or(""),
+                ]
+                .iter()
+                .any(|value| regex.is_match(value))
+            })
+        })
+        .cloned()
+        .collect();
+    let devices = catalog
+        .devices
+        .iter()
+        .filter(|entry| device.is_none_or(|value| entry.device_index == value))
+        .map(|entry| {
+            let mut kinds = BTreeMap::new();
+            for blob in &entry.blobs {
+                *kinds.entry(format!("{:?}", blob.kind)).or_insert(0usize) += 1;
+            }
+            json!({
+                "device_index": entry.device_index,
+                "blob_count": entry.blobs.len(),
+                "blob_kinds": kinds,
+                "module_count": entry.modules.len(),
+                "shader_count": entry.shaders.len(),
+                "pc_sampling": entry.pc_sampling,
+                "modules": entry.modules,
+                "blobs": include_blobs.then_some(&entry.blobs),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "capture": document.container().path,
+        "keystream": {
+            "bytes": catalog.keystream_bytes,
+            "source": catalog.keystream_source,
+        },
+        "devices": devices,
+        "shaders": page_value(&shaders, page)?,
+        "sass_hint": "Run `ngfx-trace sass <capture> <index>` to decode the attached cubin and disassemble it.",
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sass(
+    trace: PathBuf,
+    options: &AnalysisOptions,
+    selector: Option<&str>,
+    device: Option<usize>,
+    output: Option<&Path>,
+    cubin_output: Option<&Path>,
+    no_disassemble: bool,
+    nvdisasm: Option<&Path>,
+    keystream: Option<&Path>,
+    known_plaintext: Option<&Path>,
+) -> Result<Value> {
+    let document = open_document(trace, options)?;
+    let catalog = shader_catalog(&document, keystream, known_plaintext)?;
+    let candidates: Vec<_> = catalog
+        .shaders()
+        .filter(|shader| device.is_none_or(|value| shader.device_index == value))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return Err(Error::Shader(
+            "capture has no Shader Profiler shader records for the selected device".into(),
+        ));
+    }
+    let selected = select_shader(&candidates, selector)?;
+    let cubin = catalog.cubin(selected.device_index, selected.index)?;
+    if !cubin.starts_with(b"\x7fELF") {
+        return Err(Error::Shader(format!(
+            "shader {} ({}) does not reference an ELF/cubin blob",
+            selected.index, selected.name
+        )));
+    }
+    let cubin_sha256 = selected.cubin_sha256.clone();
+    if let Some(path) = cubin_output {
+        write_bytes_file(path, &cubin)?;
+    }
+
+    let mut result = json!({
+        "capture": document.container().path,
+        "keystream": {
+            "bytes": catalog.keystream_bytes,
+            "source": catalog.keystream_source,
+        },
+        "shader": selected,
+        "cubin": {
+            "size": cubin.len(),
+            "sha256": cubin_sha256,
+            "path": cubin_output,
+        },
+    });
+
+    if !no_disassemble {
+        let disassembly = disassemble(&cubin, nvdisasm)?;
+        if let Some(path) = output {
+            write_bytes_file(path, disassembly.text.as_bytes())?;
+            result["sass"] = json!({
+                "tool": disassembly.tool,
+                "args": disassembly.args,
+                "path": path,
+                "bytes": disassembly.text.len(),
+                "registers": disassembly.registers,
+                "registers_hint": disassembly.registers_hint,
+                "stats": disassembly.stats,
+                "stats_source": disassembly.stats_source,
+                "warnings": disassembly.warnings,
+            });
+        } else {
+            result["sass"] = json!({
+                "tool": disassembly.tool,
+                "args": disassembly.args,
+                "text": disassembly.text,
+                "registers": disassembly.registers,
+                "registers_hint": disassembly.registers_hint,
+                "stats": disassembly.stats,
+                "stats_source": disassembly.stats_source,
+                "warnings": disassembly.warnings,
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn select_shader<'a>(
+    candidates: &'a [nsight_gpu_trace::ShaderInfo],
+    selector: Option<&str>,
+) -> Result<&'a nsight_gpu_trace::ShaderInfo> {
+    let Some(selector) = selector else {
+        if candidates.len() == 1 {
+            return Ok(&candidates[0]);
+        }
+        return Err(Error::Shader(format!(
+            "capture has {} shaders; pass a shader index or name pattern (for example: {})",
+            candidates.len(),
+            candidates
+                .iter()
+                .take(5)
+                .map(|shader| format!("{}={}", shader.index, shader.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    };
+    if let Ok(index) = selector.parse::<usize>() {
+        return candidates
+            .iter()
+            .find(|shader| shader.index == index)
+            .ok_or_else(|| {
+                Error::Shader(format!(
+                    "shader index {index} is out of range for the selected device"
+                ))
+            });
+    }
+    let regex = RegexBuilder::new(selector)
+        .case_insensitive(true)
+        .build()
+        .map_err(Error::from)?;
+    let matches: Vec<_> = candidates
+        .iter()
+        .filter(|shader| {
+            regex.is_match(&shader.name)
+                || shader
+                    .entry_point
+                    .as_deref()
+                    .is_some_and(|value| regex.is_match(value))
+                || regex.is_match(&shader.stage)
+                || regex.is_match(&shader.shader_type)
+                || shader
+                    .pipeline
+                    .as_deref()
+                    .is_some_and(|value| regex.is_match(value))
+        })
+        .collect();
+    match matches.as_slice() {
+        [shader] => Ok(*shader),
+        [] => Err(Error::Shader(format!(
+            "no shader matched {selector:?}; available: {}",
+            candidates
+                .iter()
+                .map(|shader| format!("{}={}", shader.index, shader.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        _ => Err(Error::Shader(format!(
+            "{selector:?} matched {} shaders; use an index or a narrower pattern: {}",
+            matches.len(),
+            matches
+                .iter()
+                .map(|shader| format!("{}={}", shader.index, shader.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 fn container_info(container: Container) -> Value {

@@ -96,8 +96,13 @@ impl Container {
         let mut reader = BufReader::new(file);
         let magic = read_array::<4>(&mut reader, "file magic")?;
         if magic != WRPV_MAGIC {
+            let hint = if &magic == b"nlyp" {
+                "; this is an Nsight Graphics Capture (.ngfx-capture), not a GPU Trace (.ngfx-gputrace)"
+            } else {
+                ""
+            };
             return Err(Error::InvalidCapture(format!(
-                "bad file magic {magic:?}; expected {WRPV_MAGIC:?}"
+                "bad file magic {magic:?}; expected {WRPV_MAGIC:?}{hint}"
             )));
         }
         let version = read_u32(&mut reader, "container version")?;

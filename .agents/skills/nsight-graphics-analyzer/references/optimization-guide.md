@@ -6,11 +6,18 @@ investigation; they do not prove causality.
 
 ## Capture quality first
 
+Run `quality` (or read the `quality` block from `analyze_capture`) before using
+timing or metric claims. Check counter completeness, timestamp coverage, whether
+the API timing window fits inside the counter window, frame markers, `Time Every
+Action`, GPU clock mode, V-Sync, and action-attribution limits. A `warn` status
+is not an optimization verdict; carry the specific limitation into the claim.
+
 Before comparing measurements, use the same representative workload, camera,
 resolution, quality settings, and warmed frame window. Disable VSync and frame
 caps where practical, let background shader and pipeline compilation finish,
 minimize unrelated GPU activity, and keep traces short enough to isolate the
-workload. Change one variable per recapture.
+workload. Change one variable per recapture. Use `compare_captures` to check
+environment/settings comparability before interpreting deltas.
 
 Prefer fixed base clocks for A/B comparisons. Boost clocks answer a different
 question: attainable peak performance. Unaltered clocks are useful when clock
@@ -24,22 +31,33 @@ separate capture after ordinary counters identify a shader-limited region.
 
 ## Top-down investigation
 
+Use this sequence for an open-ended bottleneck diagnosis. For a focused
+question, start with the relevant evidence and expand only if it is inconclusive.
+
 1. Establish elapsed GPU time, frame pacing, counter-window coverage, idle
-   periods, synchronization, and whether the GPU is being fed. Investigate idle
-   or stalls before bandwidth or shader tuning.
-2. Compare SM and fixed-function percent-of-peak throughputs. Treat units within
-   about 10 percentage points as a limiter cluster rather than forcing a single
-   winner. A lead of roughly 15 points is stronger, still provisional evidence.
+   periods, synchronization, and whether the GPU is being fed. Use the
+   `timeline` queues, gaps, overlap, and frame summary. Investigate idle or
+   stalls before bandwidth or shader tuning.
+2. Compare SM and fixed-function percent-of-peak throughputs at both
+   duration-weighted mean and p95/max. A high p95 with a lower mean is burst
+   pressure; inspect per-sample series and timing buckets rather than calling it
+   sustained pressure. Treat units within about 10 percentage points as a
+   limiter cluster rather than forcing a single winner. A lead of roughly 15
+   points is stronger, still provisional evidence.
 3. Compare memory tiers with compute. For a memory-heavy region, follow traffic
    through L1TEX, L2, VRAM, then PCIe. For a compute-heavy region, inspect SM
    issue, shader-stage work, dependency stalls, registers, shared memory, and
    occupancy constraints.
 4. Inspect raster/geometry, overdraw, copies, and small actions only after the
    dominant axis is known.
-5. Localize the signal in `analyze_capture` regions, then batch `scopes`,
-   `timings`, and `metric_evaluation` queries for the winning stable scope ID.
-   Compare adjacent units to distinguish backpressure from the unit that
-   originated it.
+5. Localize the signal in `analyze_capture` regions. Regions are ranked by
+   duration, metric pressure, and metric anomaly; do not assume the longest
+   region is the only candidate. Use `scope_evidence` to join timing, metric
+   summaries, calls, and action state for one scope, then batch `scopes`,
+   `timings`, and `metric_evaluation` queries for other candidates. Use
+   `frame_series` when the question is about frame-to-frame behavior or
+   regression rather than one capture-wide average. Compare adjacent units to
+   distinguish backpressure from the unit that originated it.
 6. Form one falsifiable experiment and state the metric and timing change that
    would support or reject it.
 
@@ -91,17 +109,24 @@ For many small actions, first verify that timing is action-precise. Then test
 batching, indirect/multi-draw submission, state sorting, or moving repeated CPU
 work to GPU-driven structures. Preserve ordering and synchronization semantics.
 
-## Reporting contract
+## Reporting
 
-An actionable finding contains:
+Report the evidence needed to support the answer: scope and timing attribution,
+relevant metrics with units and coverage, and uncertainty in causal or source
+attribution. For optimization proposals, include the expected effect and material
+correctness or quality risks. Include baseline/recapture comparisons only when
+measured; do not require another capture to deliver an analysis-only result.
 
-- the stable scope ID and label;
-- timing precision and duration evidence;
-- exact metric names, values, units, and coverage;
-- the bottleneck hypothesis and competing explanation;
-- the source correlation strength;
-- one proposed change, expected metric movement, and correctness/quality risk;
-- the same-settings baseline and recapture result.
+For a measured comparison, use `compare_captures` and report:
+
+- comparability warnings for GPU, driver, product version, API, and settings;
+- the metric and scope deltas with their bootstrap intervals;
+- whether the interval includes zero; and
+- shader/cubin changes when both captures contain Shader Profiler data.
+
+The comparison is evidence, not a verdict. Do not claim that a change caused an
+improvement from a single pair of captures or from an interval that includes
+zero. Repeat captures belong to the external experiment loop.
 
 ## Source basis
 

@@ -18,6 +18,12 @@ recovers descriptors embedded in the user's installed WarpViz plugin binary.
 Metric formulas and counter data are likewise supplied only by the user's
 installed NVIDIA library and capture.
 
+`assets/shader_profiler_keystream.bin` is a compatibility XOR pad recovered from
+the capture format's reused `OBFUSCATION_SIMPLE` stream. It contains no shader
+code, cubin, protobuf schema, or NVIDIA binary. A caller can replace it with a
+stream recovered from another producer, or recover the stream from a known
+plaintext shader instead.
+
 Documentation consulted during design:
 
 - https://docs.nvidia.com/nsight-graphics/UserGuide/gpu-trace-overview.html

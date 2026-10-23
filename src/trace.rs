@@ -324,11 +324,50 @@ pub fn discover_schema_binary(explicit: Option<&Path>) -> Result<PathBuf> {
     for root in &roots {
         find_named_file(root, SCHEMA_FILENAME, 8, &mut candidates);
     }
-    candidates.sort();
+    sort_by_newest(&mut candidates);
     candidates.pop().ok_or(Error::Discovery {
         kind: "WarpVizPlugin schema binary (set NGFX_SCHEMA_BINARY)",
         searched: roots,
     })
+}
+
+/// Order discovered Nsight host files by the version embedded in their path,
+/// then by modification time. Lexicographic ordering incorrectly ranks
+/// `2026.3` below `2026.10`.
+pub(crate) fn sort_by_newest(candidates: &mut [PathBuf]) {
+    candidates.sort_by(|left, right| {
+        version_key(left)
+            .cmp(&version_key(right))
+            .then_with(|| modified_ns(left).cmp(&modified_ns(right)))
+    });
+}
+
+fn version_key(path: &Path) -> (u64, u64, u64) {
+    let text = path.to_string_lossy();
+    let numbers: Vec<u64> = text
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    for (index, number) in numbers.iter().enumerate() {
+        if (2000..=2100).contains(number) {
+            return (
+                *number,
+                numbers.get(index + 1).copied().unwrap_or(0),
+                numbers.get(index + 2).copied().unwrap_or(0),
+            );
+        }
+    }
+    (0, 0, 0)
+}
+
+fn modified_ns(path: &Path) -> u128 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
 }
 
 pub(crate) fn nsight_search_roots() -> Vec<PathBuf> {
