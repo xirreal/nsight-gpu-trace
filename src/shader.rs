@@ -1005,7 +1005,7 @@ fn shader_info(
         .or_else(|| entry_point.clone().filter(|value| value != "main"))
         .or_else(|| source_file.as_deref().map(file_label))
         .or_else(|| pipeline_name.clone())
-        .unwrap_or_else(|| format!("{} shader {index}", stage));
+        .unwrap_or_else(|| format!("{stage} shader {index}"));
     let sm = shader
         .common_program_meta
         .as_ref()
